@@ -1,3 +1,27 @@
-toddric-1_5b-merged-v1
-__pycache__
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
 .env
+venv/
+ENV/
+
+# Distribution / packaging
+toddric-1_5b-merged-v1
+dist/
+build/
+*.egg
+
+# Logs and databases
+*.log
+*.sqlite
+store/
+models/
+
+# IDEs and editors
+.vscode/
+.idea/
+*.swp
