@@ -11,7 +11,7 @@ export TODDRIC_MODEL_REVISION="${TODDRIC_MODEL_REVISION:-main}"
 export HF_TOKEN="${HF_TOKEN:-}"   # set if needed
 
 # Ensure model exists (idempotent)
-./scripts/get_model.sh
+./get_model.sh
 
 # Your existing runtime knobs (keep whatever you use)
 export RL_MAX="${RL_MAX:-30}"

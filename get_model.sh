@@ -37,7 +37,7 @@ echo "[get_model] Downloading snapshot to $MODEL_DIR ..."
 hf download "$MODEL_ID" \
   --revision "$REVISION" \
   --local-dir "$MODEL_DIR" \
-  --local-dir-use-symlinks False
+#  --local-dir-use-symlinks False
 
 echo "[get_model] Ready → $MODEL_DIR"
 
