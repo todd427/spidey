@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>toddric — Web UI</title>
+  <style>
+    :root { --bg:#0b0c10; --panel:#111317; --ink:#e6e6e6; --muted:#9aa0a6; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.4 system-ui, -apple-system, Segoe UI, Roboto, Inter, Arial, sans-serif; }
+    header { padding:12px 16px; background:var(--panel); border-bottom:1px solid #1f232a; }
+    header h1 { margin:0; font-size:16px; letter-spacing:.3px; display:flex; align-items:center; gap:8px; }
+    .pill{display:inline-flex;gap:6px;align-items:center;padding:2px 8px;border-radius:999px;background:#0e1116;color:#cbd5e1;font-size:12px}
+    .flag{width:14px;height:10px;border-radius:2px;background:linear-gradient(90deg,#169b62 33%,#fff 33% 66%,#ff883e 66%)}
+    .wrap { max-width:920px; margin:0 auto; padding:12px 16px 120px; }
+    .chat { display:flex; flex-direction:column; gap:12px; }
+    .bubble { max-width:80%; padding:10px 12px; border-radius:14px; white-space:pre-wrap; word-wrap:break-word; }
+    .user { align-self:flex-end; background:linear-gradient(180deg, #243b7b, #1e3a8a); }
+    .bot  { align-self:flex-start; background:linear-gradient(180deg, #148f77, #0b6b53); }
+    .composer { position:fixed; bottom:0; left:0; right:0; background:var(--panel); border-top:1px solid #1f232a; }
+    .composer .inner { max-width:920px; margin:0 auto; padding:12px 16px; display:grid; grid-template-columns:1fr auto; gap:10px; }
+    textarea { resize:none; height:84px; padding:10px 12px; background:#0e1116; color:var(--ink); border:1px solid #23262d; border-radius:12px; outline:none; }
+    textarea:focus { border-color:#3b82f6; }
+    button { border:0; padding:0 16px; border-radius:12px; background:#3b82f6; color:white; font-weight:600; cursor:pointer; }
+    button[disabled] { opacity:.6; cursor:not-allowed; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>toddric • Web UI <span class="pill"><span class="flag"></span> cloudflared-ready</span></h1>
+  </header>
+
+  <div class="wrap">
+    <div id="chat" class="chat" aria-live="polite"></div>
+
+    <div class="composer">
+      <div class="inner">
+        <textarea id="input" placeholder="Type a message… (Shift+Enter = newline)"></textarea>
+        <button id="send">Send</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+(() => {
+  const el = s => document.querySelector(s);
+  const chat = el('#chat');
+  const input = el('#input');
+  const sendBtn = el('#send');
+
+  function scrollToBottom() {
+    requestAnimationFrame(() => window.scrollTo({ top: document.body.scrollHeight }));
+  }
+
+  function addBubble(text, who='bot') {
+    const b = document.createElement('div');
+    b.className = `bubble ${who}`;
+    b.textContent = text;
+    chat.appendChild(b);
+    scrollToBottom();
+  }
+
+  async function sendMessage() {
+    const message = input.value.trim();
+    if (!message) return;
+
+    addBubble(message, 'user');
+    input.value = '';
+    sendBtn.disabled = true;
+
+    try {
+      const res = await fetch('/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }, // cookie handles auth
+        body: JSON.stringify({ message, session_id: 'web' })
+      });
+
+      if (!res.ok) {
+        const msg = await res.text();
+        addBubble(`Error ${res.status}: ${msg}`, 'bot');
+      } else {
+        const data = await res.json();
+        addBubble(data.text || '[no reply]', 'bot');
+      }
+    } catch (err) {
+      addBubble('Network error', 'bot');
+      console.error(err);
+    } finally {
+      sendBtn.disabled = false;
+    }
+  }
+
+  sendBtn.addEventListener('click', sendMessage);
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  });
+
+  addBubble("Hi! I’m toddric on the web. Ask me anything.");
+})();
+</script>
+</body>
+</html>
+
