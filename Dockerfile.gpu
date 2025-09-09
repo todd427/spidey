@@ -1,0 +1,74 @@
+# syntax=docker/dockerfile:1
+#
+# GPU-ready Dockerfile for spidey (Python 3.12, venv, non-root)
+# Runtime GPU access requires NVIDIA Container Toolkit on the host and `gpus: all` in docker-compose.yml.
+# Ensure requirements.txt installs a CUDA-enabled PyTorch wheel, e.g.:
+#     torch --index-url https://download.pytorch.org/whl/cu121
+# Optionally include `bitsandbytes` for 8-bit/4-bit loading.
+#
+# Hugging Face: pass HUGGINGFACE_HUB_TOKEN at runtime (env_file/.env).
+
+FROM python:3.12-slim AS base
+
+# Create a dedicated venv and keep Python sane
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HF_HOME=/app/.cache/huggingface \
+    VIRTUAL_ENV=/opt/venv
+RUN python -m venv $VIRTUAL_ENV
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+WORKDIR /app
+
+# System deps (git for HF, curl for healthcheck, libgomp for some wheels)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git curl ca-certificates libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Leverage build cache for pip install
+COPY requirements.txt /app/requirements.txt
+RUN pip install --upgrade pip setuptools wheel && \
+    pip install -r /app/requirements.txt
+
+# Copy app source
+COPY . /app
+
+# Non-root runtime user
+RUN useradd -m -u 10001 appuser && chown -R appuser:appuser /app
+USER appuser
+
+# Expose & healthcheck
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=5 \
+  CMD curl -fsS http://localhost:8000/docs >/dev/null || exit 1
+
+# Runtime defaults (override in compose/.env)
+ENV HOST=0.0.0.0 \
+    PORT=8000 \
+    MODEL_NAME=toddie314/toddric-1_5b-merged-v1
+
+# Persist model/cache/store between runs when mounted from host
+VOLUME ["/app/models", "/app/store", "/app/.cache"]
+
+# ---- Optional: Prefetch model at build to reduce first-run latency ----
+ARG HUGGINGFACE_HUB_TOKEN
+ENV HUGGINGFACE_HUB_TOKEN=${HUGGINGFACE_HUB_TOKEN}
+RUN python - <<'PY'
+import os
+from huggingface_hub import login
+tok = os.getenv("HUGGINGFACE_HUB_TOKEN")
+if tok: login(tok, add_to_git_credential=False)
+PY
+RUN python - <<'PY'
+import os
+from transformers import AutoTokenizer, AutoModelForCausalLM
+m = os.environ.get("MODEL_NAME", "toddie314/toddric-1_5b-merged-v1")
+tok = os.environ.get("HUGGINGFACE_HUB_TOKEN")
+AutoTokenizer.from_pretrained(m, token=tok)
+AutoModelForCausalLM.from_pretrained(m, token=tok, device_map="auto", dtype="auto")
+PY
+# ----------------------------------------------------------------------------
+
+# Start the server (expects FastAPI app exposed as `app` in app_toddric.py)
+CMD ["uvicorn", "app_toddric:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -11,6 +11,8 @@ ENV/
 
 # Distribution / packaging
 toddric-1_5b-merged-v1
+bin/
+cache/
 dist/
 build/
 *.egg
