@@ -1,10 +1,10 @@
 # toddric_chat.py
 # Chat engine wrapper for spidey/Toddric.
-# - Env precedence for model: MODEL_NAME > TODDRIC_MODEL > MODEL > default HF id
-# - Uses new `dtype=` kwarg (no deprecated torch_dtype warning)
-# - Supports HF private/gated repos via HUGGINGFACE_HUB_TOKEN/HF_TOKEN
-# - Optional 4/8-bit loading (requires bitsandbytes when on GPU)
-# - Simple prompt formatting; configurable gen params via env
+# - Model env precedence: MODEL_NAME > TODDRIC_MODEL > MODEL > default HF id
+# - HF auth: uses HUGGINGFACE_HUB_TOKEN / HF_TOKEN; only "login" if HF_TOKEN isn't already set
+# - dtype compatibility: prefers dtype=... (new), falls back to torch_dtype=... (old); if auto, passes nothing
+# - Optional 4/8-bit quant (requires CUDA + bitsandbytes; otherwise ignored)
+# - Minimal chat() API returning dict with text + metadata
 
 from __future__ import annotations
 
@@ -82,7 +82,7 @@ class EngineConfig:
                 bits = b
 
         # dtype: prefer DTYPE, fallback to TORCH_DTYPE, default "auto"
-        dtype = (os.getenv("DTYPE") or os.getenv("TORCH_DTYPE") or "auto").strip()
+        dtype = (os.getenv("DTYPE") or os.getenv("TORCH_DTYPE") or "auto").strip().lower()
 
         max_new = _env_int("MAX_NEW_TOKENS", 256)
         temp = _env_float("TEMPERATURE", 0.7)
@@ -118,8 +118,19 @@ class ChatEngine:
         # Token for private/gated repos
         self.hf_token = os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
 
+        # Make token globally visible for hub utilities (e.g., list_repo_tree) ONLY if HF_TOKEN isn't already set.
+        # This avoids the "HF_TOKEN is current active token" warning.
+        if self.hf_token and not os.getenv("HF_TOKEN"):
+            try:
+                from huggingface_hub import login, HfFolder
+                HfFolder.save_token(self.hf_token)
+                login(self.hf_token, add_to_git_credential=False)
+                log.info("[toddric_chat] Hugging Face token saved and session logged in.")
+            except Exception as e:
+                log.warning(f"[toddric_chat] HF login/save token failed: {e}")
+
         # Fetch config/tokenizer with token
-        acfg = AutoConfig.from_pretrained(
+        _ = AutoConfig.from_pretrained(
             cfg.model,
             trust_remote_code=cfg.trust_remote_code,
             token=self.hf_token,
@@ -138,27 +149,50 @@ class ChatEngine:
             low_cpu_mem_usage=True,
         )
 
-        # dtype (new name replacing torch_dtype in Transformers)
-        if cfg.dtype == "auto":
-            load_kwargs["dtype"] = "auto"
-        elif cfg.dtype:
+        # ---------- dtype compatibility shim ----------
+        # If dtype == "auto": pass no dtype kw (most compatible).
+        # Else, resolve torch.<dtype> and try dtype=... (new); on TypeError fallback to torch_dtype=... (old).
+        resolved_dtype = None
+        if cfg.dtype and cfg.dtype != "auto":
             try:
-                load_kwargs["dtype"] = getattr(torch, cfg.dtype)
+                resolved_dtype = getattr(torch, cfg.dtype)
             except Exception:
-                load_kwargs["dtype"] = "auto"
+                resolved_dtype = None
+        # ---------- end dtype shim ----------
 
-        # Optional 4/8-bit loading
-        if cfg.bits in (4, 8):
-            if cfg.bits == 4:
-                load_kwargs.update(dict(load_in_4bit=True))
-            elif cfg.bits == 8:
-                load_kwargs.update(dict(load_in_8bit=True))
+        # Optional 4/8-bit loading (only when CUDA & bitsandbytes available)
+        if cfg.bits in (4, 8) and torch.cuda.is_available():
+            try:
+                import bitsandbytes as _  # noqa: F401
+                if cfg.bits == 4:
+                    load_kwargs.update(dict(load_in_4bit=True))
+                elif cfg.bits == 8:
+                    load_kwargs.update(dict(load_in_8bit=True))
+            except Exception as e:
+                log.warning(f"[toddric_chat] bitsandbytes not available; ignoring BITS={cfg.bits} ({e})")
 
         # Pass token explicitly if present
         if self.hf_token:
             load_kwargs["token"] = self.hf_token
 
-        self.model = AutoModelForCausalLM.from_pretrained(cfg.model, **load_kwargs)
+        # Load model with dtype shim handling
+        if resolved_dtype is not None:
+            try:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    cfg.model, dtype=resolved_dtype, **load_kwargs
+                )
+            except TypeError as e:
+                if "dtype" in str(e):
+                    # Older transformers: retry with torch_dtype
+                    self.model = AutoModelForCausalLM.from_pretrained(
+                        cfg.model, torch_dtype=resolved_dtype, **load_kwargs
+                    )
+                else:
+                    raise
+        else:
+            # No explicit dtype requested; let transformers decide
+            self.model = AutoModelForCausalLM.from_pretrained(cfg.model, **load_kwargs)
+
         self.model.eval()
 
         # Generation defaults
@@ -248,3 +282,4 @@ def chat(message: str, session_id: Optional[str] = None) -> Dict[str, Any]:
         "model": eng.cfg.model,
         "session_id": session_id,
     }
+
