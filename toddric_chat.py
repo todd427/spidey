@@ -118,16 +118,6 @@ class ChatEngine:
         # Token for private/gated repos
         self.hf_token = os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
 
-        # Make token globally visible for hub utilities (e.g., list_repo_tree)
-        if self.hf_token:
-            try:
-                from huggingface_hub import login, HfFolder
-                HfFolder.save_token(self.hf_token)
-                login(self.hf_token, add_to_git_credential=False)
-                log.info("[toddric_chat] Hugging Face token saved and session logged in.")
-            except Exception as e:
-                log.warning(f"[toddric_chat] HF login/save token failed: {e}")
-
         # Fetch config/tokenizer with token
         acfg = AutoConfig.from_pretrained(
             cfg.model,
@@ -258,4 +248,3 @@ def chat(message: str, session_id: Optional[str] = None) -> Dict[str, Any]:
         "model": eng.cfg.model,
         "session_id": session_id,
     }
-
