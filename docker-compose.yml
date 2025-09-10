@@ -1,28 +1,29 @@
 services:
   spidey:
-    user: "${UID:-1000}:${GID:-1000}"
-    build:
-      context: .
-      dockerfile: Dockerfile
+    build: .
     container_name: spidey
     ports:
-      - "${PORT-8000}:8000"
+      - "${PORT:-8000}:8000"
+    # Pass runtime secrets/config (Bearer, HF token, etc.)
     env_file:
       - .env
-    gpus: all
     environment:
-      - MODEL_NAME=${MODEL_NAME:-toddie314/toddric-1_5b-merged-v1}
-      - HUGGINGFACE_HUB_TOKEN=${HUGGINGFACE_HUB_TOKEN}
-      - HF_HOME=/app/.cache/huggingface
-      - DTYPE=float16
-      - BITS=0
-      # Auth flags (dev vs prod)
-      - TODDRIC_BEARER=${TODDRIC_BEARER:-}
-      - ALLOW_NO_AUTH=${ALLOW_NO_AUTH:-0}
-      - TOKEN_COOKIE_SECURE=${TOKEN_COOKIE_SECURE:-0}
+      - HF_HOME=/cache/hf
+      - HF_HUB_DISABLE_SYMLINKS_WARNING=1
     volumes:
       - ./models:/app/models
       - ./store:/app/store
-      - ./cache:/app/.cache
+      - hf-cache:/cache/hf
     restart: unless-stopped
+    # GPU (optional) — uncomment if NVIDIA runtime is set up:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  hf-cache: {}
 
