@@ -1,298 +1,548 @@
 # app_toddric.py
-import os, time, json
-from typing import Optional, Dict, AsyncGenerator
+import os, time, json, pathlib, datetime, threading, uuid
+from dataclasses import dataclass
+from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, Request, HTTPException, Depends
-from fastapi.responses import StreamingResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import (
+    JSONResponse, PlainTextResponse, HTMLResponse, RedirectResponse
+)
 from pydantic import BaseModel
-from starlette.responses import Response
 
-# -----------------------------------------------------------------------------
-# App
-# -----------------------------------------------------------------------------
-app = FastAPI(title="toddric API", version="1.1.0")
+try:
+    from transformers import AutoConfig
+except Exception:
+    AutoConfig = None
 
-# -----------------------------------------------------------------------------
-# Models
-# -----------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Config / system prompt
+
+def _load_system_prompt() -> str:
+    env_p = os.getenv("SYSTEM_PROMPT", "").strip()
+    if env_p:
+        return env_p
+    path = os.getenv("SYSTEM_PROMPT_FILE", "prompts/system_toddric.md")
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                txt = f.read().strip()
+                if txt:
+                    return txt
+    except Exception:
+        pass
+    return (
+        "Always prefix replies with [TODDRIC]. "
+        "You are Toddric — pragmatic, nerdy, playful, and wise. Speak plainly, avoid fluff. "
+        "Push back gently on falsehoods; explain the correction. Prefer 3–6 tight sentences. "
+        "If uncertain, say 'Not sure.' Use tools (RAG, Memory, Location, Weather) when helpful. "
+        "Label speculation."
+    )
+
+@dataclass
+class Cfg:
+    MODEL_ID: str = os.getenv("MODEL_ID", "toddie314/toddric-1_5b-merged-v1")
+    MODEL_DIR: Optional[str] = os.getenv("MODEL_DIR") or None
+    MODEL_REV: str = os.getenv("MODEL_REV", "main")
+    TORCH_DEVICE: str = os.getenv("TORCH_DEVICE", "auto")
+    SYSTEM_PROMPT: str = _load_system_prompt()
+    # decoding defaults
+    MAX_NEW_TOKENS: int = int(os.getenv("MAX_NEW_TOKENS", "512"))
+    TEMPERATURE: float = float(os.getenv("TEMPERATURE", "0.7"))
+    TOP_P: float = float(os.getenv("TOP_P", "0.95"))
+    TOP_K: int = int(os.getenv("TOP_K", "50"))
+    DO_SAMPLE: bool = os.getenv("DO_SAMPLE", "1") not in ("0", "false", "False")
+    REP_PEN: float = float(os.getenv("REPETITION_PENALTY", "1.12"))
+
+_cfg = Cfg()
+print(f"[toddric] MODEL_ID={_cfg.MODEL_ID}  MODEL_DIR={_cfg.MODEL_DIR}  REV={_cfg.MODEL_REV}")
+print(f"[toddric] SYSTEM head={_cfg.SYSTEM_PROMPT[:96]!r}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Auth
+
+API_TOKEN = os.getenv("TODDRIC_BEARER", "").strip()
+ALLOW_NO_AUTH = os.getenv("ALLOW_NO_AUTH", "0") in ("1", "true", "True")
+
+def _require_bearer(request: Request):
+    if ALLOW_NO_AUTH:
+        return True
+    if not API_TOKEN:
+        raise RuntimeError("TODDRIC_BEARER is not set. Set ALLOW_NO_AUTH=1 to bypass (dev only).")
+    h = request.headers.get("authorization", "")
+    if not h.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing Bearer token")
+    if h.split(" ", 1)[1].strip() != API_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid Bearer token")
+    return True
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Transcript logging (JSONL with rotation)
+
+_LOG_ON = os.getenv("LOG_TRANSCRIPTS", "0") not in ("0", "false", "False")
+_LOG_DIR = os.getenv("LOG_DIR", "./logs")
+_LOG_ROTATE_MB = int(os.getenv("LOG_ROTATE_MB", "50"))
+_log_lock = threading.Lock()
+_log_fp = None
+_log_path = None
+
+def _now_iso():
+    return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+def _ensure_log_file():
+    global _log_fp, _log_path
+    if not _LOG_ON:
+        return None
+    os.makedirs(_LOG_DIR, exist_ok=True)
+    if _log_fp:
+        try:
+            if os.path.getsize(_log_path) >= (_LOG_ROTATE_MB * 1024 * 1024):
+                _log_fp.close()
+                _log_fp = None
+        except FileNotFoundError:
+            _log_fp = None
+    if _log_fp is None:
+        stamp = datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        _log_path = os.path.join(_LOG_DIR, f"transcripts-{stamp}.jsonl")
+        _log_fp = open(_log_path, "a", encoding="utf-8")
+    return _log_fp
+
+def log_event(event: dict):
+    if not _LOG_ON:
+        return
+    with _log_lock:
+        fp = _ensure_log_file()
+        if fp:
+            fp.write(json.dumps(event, ensure_ascii=False) + "\n")
+            fp.flush()
+
+def log_session_start(session_id: str, system_prompt: str, cfg: Cfg):
+    if not _LOG_ON:
+        return
+    log_event({
+        "type": "session_start",
+        "time": _now_iso(),
+        "session_id": session_id,
+        "system_head": (system_prompt or "")[:400],
+        "model_id": cfg.MODEL_ID,
+        "model_dir": cfg.MODEL_DIR,
+        "decode_defaults": {
+            "max_new_tokens": cfg.MAX_NEW_TOKENS,
+            "temperature": cfg.TEMPERATURE,
+            "top_p": cfg.TOP_P,
+            "top_k": cfg.TOP_K,
+            "do_sample": cfg.DO_SAMPLE,
+            "repetition_penalty": cfg.REP_PEN,
+        },
+        "server_pid": os.getpid(),
+        "instance": str(uuid.uuid4()),
+    })
+
+def log_turn(session_id: str, user_text: str, assistant_text: str, meta: dict):
+    if not _LOG_ON:
+        return
+    log_event({
+        "type": "turn",
+        "time": _now_iso(),
+        "session_id": session_id,
+        "user": user_text,
+        "assistant": assistant_text,
+        "meta": meta,
+    })
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FastAPI app
+
+app = FastAPI(title="Spidey / Toddric", version="1.8")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+@app.middleware("http")
+async def _cache_headers(request: Request, call_next):
+    resp = await call_next(request)
+    resp.headers.setdefault("Cache-Control", "private, max-age=5")
+    return resp
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Chat engine compatibility cfg
+
+def _compat_cfg_for_chatengine():
+    class Compat:
+        def __init__(self, preset: dict): self.__dict__.update(preset)
+        def __getattr__(self, name):
+            defaults = {
+                "device": "auto", "device_map": "auto",
+                "torch_dtype": "auto", "dtype": self.__dict__.get("torch_dtype", "auto"),
+                "bits": None, "load_in_4bit": False, "load_in_8bit": False,
+                "bnb_4bit_use_double_quant": True, "bnb_4bit_quant_type": "nf4",
+                "bnb_4bit_compute_dtype": "bfloat16",
+                "trust_remote_code": True,
+                "max_new_tokens": _cfg.MAX_NEW_TOKENS, "temperature": _cfg.TEMPERATURE,
+                "top_p": _cfg.TOP_P, "top_k": _cfg.TOP_K, "do_sample": _cfg.DO_SAMPLE,
+            }
+            return defaults.get(name, None)
+
+    load4 = os.getenv("LOAD_IN_4BIT", "0") not in ("0", "false", "False")
+    load8 = os.getenv("LOAD_IN_8BIT", "0") not in ("0", "false", "False")
+    bits = 4 if load4 else (8 if load8 else None)
+
+    preset = {
+        "model_dir": _cfg.MODEL_DIR,
+        "model": _cfg.MODEL_DIR or _cfg.MODEL_ID,
+        "revision": _cfg.MODEL_REV,
+        "system_prompt": _cfg.SYSTEM_PROMPT,
+        "device": _cfg.TORCH_DEVICE,
+        "device_map": os.getenv("DEVICE_MAP", "auto"),
+        "torch_dtype": os.getenv("TORCH_DTYPE", "auto"),
+        "dtype": os.getenv("DTYPE", os.getenv("TORCH_DTYPE", "auto")),
+        "load_in_4bit": load4, "load_in_8bit": load8, "bits": bits,
+        "trust_remote_code": True,
+    }
+    return Compat(preset)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Engine adapter (persona hardening)
+
+def _engine_adapter(obj):
+    class Adapter:
+        def __init__(self, inner):
+            self.inner = inner
+            self._has_stream = hasattr(inner, "stream") and callable(getattr(inner, "stream"))
+
+        def _call_with_fallbacks(self, fn, message, session_id, kwargs):
+            try:
+                return fn(message, session_id=session_id, **kwargs)
+            except TypeError:
+                try:
+                    return fn(message, session_id=session_id)
+                except TypeError:
+                    return fn(message)
+
+        def chat(self, message: str, session_id: str = "default",
+                 max_new_tokens: Optional[int] = None,
+                 temperature: Optional[float] = None,
+                 top_p: Optional[float] = None,
+                 top_k: Optional[int] = None,
+                 do_sample: Optional[bool] = None,
+                 repetition_penalty: Optional[float] = None):
+            persona = os.getenv("SYSTEM_PROMPT_PREFIX", _cfg.SYSTEM_PROMPT).strip()
+            if persona:
+                message = f"{persona}\n\nUser: {message}\nAssistant:"
+
+            kwargs = {}
+            if max_new_tokens is not None: kwargs["max_new_tokens"] = max_new_tokens
+            if temperature    is not None: kwargs["temperature"]    = temperature
+            if top_p          is not None: kwargs["top_p"]          = top_p
+            if top_k          is not None: kwargs["top_k"]          = top_k
+            if do_sample      is not None: kwargs["do_sample"]      = do_sample
+            if repetition_penalty is not None: kwargs["repetition_penalty"] = repetition_penalty
+
+            o = self.inner
+            if hasattr(o, "chat") and callable(getattr(o, "chat")):
+                res = self._call_with_fallbacks(o.chat, message, session_id, kwargs)
+            elif hasattr(o, "generate") and callable(getattr(o, "generate")):
+                res = self._call_with_fallbacks(o.generate, message, session_id, kwargs)
+            elif callable(o):
+                res = self._call_with_fallbacks(o, message, session_id, kwargs)
+            else:
+                raise AttributeError("ChatEngine object has no usable interface (.chat/.generate/callable)")
+
+            if isinstance(res, str):
+                return {"text": res, "used_rag": False}
+            if isinstance(res, dict):
+                txt = res.get("text") or res.get("reply") or ""
+                return {**res, "text": str(txt)}
+            txt = getattr(res, "text", None)
+            return {"text": str(txt if txt is not None else res), "used_rag": False}
+
+        def stream(self, message: str, session_id: str = "default", **gen_kwargs):
+            if self._has_stream:
+                try:
+                    return self.inner.stream(message, session_id=session_id, **gen_kwargs)
+                except TypeError:
+                    pass
+            yield self.chat(message, session_id=session_id, **gen_kwargs)["text"]
+
+    return Adapter(obj)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Engine builder (toddric_chat preferred → Minimal fallback)
+
+_engine = None
+
+def _build_minimal_engine():
+    import torch
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+
+    model_path = _cfg.MODEL_DIR or _cfg.MODEL_ID
+    print(f"[toddric] MinimalEngine loading: {model_path}")
+
+    tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    lm  = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
+
+    device = "cuda" if torch.cuda.is_available() and _cfg.TORCH_DEVICE != "cpu" else "cpu"
+    dtype  = torch.bfloat16 if (device == "cuda") else torch.float32
+    lm.to(device=device, dtype=dtype).eval()
+
+    if tok.pad_token_id is None:
+        tok.pad_token = tok.eos_token
+    tok.padding_side = "left"
+
+    system = _cfg.SYSTEM_PROMPT
+
+    class MinimalEngine:
+        def chat(self, message: str, session_id: str = "default",
+                 max_new_tokens: Optional[int] = None,
+                 temperature: Optional[float] = None,
+                 top_p: Optional[float] = None,
+                 top_k: Optional[int] = None,
+                 do_sample: Optional[bool] = None,
+                 repetition_penalty: Optional[float] = None):
+            M = max_new_tokens if max_new_tokens is not None else _cfg.MAX_NEW_TOKENS
+            T = temperature    if temperature    is not None else _cfg.TEMPERATURE
+            P = top_p          if top_p          is not None else _cfg.TOP_P
+            K = top_k          if top_k          is not None else _cfg.TOP_K
+            S = do_sample      if do_sample      is not None else _cfg.DO_SAMPLE
+            R = repetition_penalty if repetition_penalty is not None else _cfg.REP_PEN
+
+            try:
+                msgs = [{"role":"system","content": system},
+                        {"role":"user","content": message}]
+                ids = tok.apply_chat_template(msgs, add_generation_prompt=True,
+                                              return_tensors="pt", padding=True)
+            except Exception:
+                prompt = f"{system}\n\nUser: {message}\nAssistant:"
+                ids = tok(prompt, return_tensors="pt").input_ids
+            attn = (ids != tok.pad_token_id).long()
+            ids, attn = ids.to(device), attn.to(device)
+
+            with torch.no_grad():
+                out = lm.generate(
+                    ids, attention_mask=attn,
+                    max_new_tokens=M, do_sample=S,
+                    temperature=T, top_p=P, top_k=K,
+                    repetition_penalty=R,
+                )
+            text = tok.decode(out[0], skip_special_tokens=True)
+            for tag in ("<|assistant|>", "Assistant:", "assistant\n"):
+                if tag in text:
+                    text = text.split(tag)[-1].strip()
+            return {"text": text, "used_rag": False}
+
+        def stream(self, message: str, session_id: str = "default", **_):
+            yield self.chat(message, session_id=session_id)["text"]
+
+    print("[toddric] Using MinimalEngine (built-in)")
+    return MinimalEngine()
+
+def _get_engine():
+    global _engine
+    if _engine is not None:
+        return _engine
+    try:
+        from toddric_chat import ChatEngine as _ChatEngine  # type: ignore
+        compat = _compat_cfg_for_chatengine()
+        raw = _ChatEngine(compat)
+        _engine = _engine_adapter(raw)
+        print("[toddric] Using ChatEngine from toddric_chat (adapter)")
+        return _engine
+    except Exception as e:
+        print(f"[toddric] ChatEngine not available/compatible: {e!r}")
+    _engine = _engine_adapter(_build_minimal_engine())
+    return _engine
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Schemas
+
 class ChatRequest(BaseModel):
     message: str
-    session_id: str = "web"
+    session_id: Optional[str] = "web"
+    max_new_tokens: Optional[int] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
+    do_sample: Optional[bool] = None
 
 class ChatResponse(BaseModel):
     text: str
     used_rag: bool = False
-    provenance: Optional[dict] = None
+    provenance: Optional[Dict[str, Any]] = None
     latency_ms: Optional[int] = None
+    truncated: Optional[bool] = None
 
-# -----------------------------------------------------------------------------
-# Auth: TODDRIC_BEARER required unless ALLOW_NO_AUTH=1 (dev)
-# Delivered to browser via HttpOnly cookie (hidden from JS).
-# -----------------------------------------------------------------------------
-API_TOKEN = os.getenv("TODDRIC_BEARER", "").strip()
-TOKEN_COOKIE_NAME = os.getenv("TOKEN_COOKIE_NAME", "toddric_token")
-TOKEN_COOKIE_SECURE = os.getenv("TOKEN_COOKIE_SECURE", "0") == "1"  # set to 1 in prod (HTTPS)
-TOKEN_COOKIE_SAMESITE = os.getenv("TOKEN_COOKIE_SAMESITE", "Lax")   # Lax or Strict
-ALLOW_NO_AUTH = os.getenv("ALLOW_NO_AUTH", "0") == "1"
+# ──────────────────────────────────────────────────────────────────────────────
+# Routes
 
-@app.on_event("startup")
-async def _auth_startup_check():
-    if not API_TOKEN and not ALLOW_NO_AUTH:
-        raise RuntimeError(
-            "TODDRIC_BEARER is not set. Refusing to start without auth. "
-            "Set ALLOW_NO_AUTH=1 to bypass (dev only)."
-        )
+@app.get("/", response_class=RedirectResponse)
+def root_redirect():
+    return RedirectResponse(url="/ui")
 
-@app.middleware("http")
-async def inject_auth_cookie(request: Request, call_next):
-    """
-    For same-origin page/static GET/HEAD, set an HttpOnly cookie with the bearer token.
-    JS cannot read it; browser includes it automatically on API calls.
-    """
-    response: Response = await call_next(request)
-    if request.method in ("GET", "HEAD") and API_TOKEN:
-        if not request.cookies.get(TOKEN_COOKIE_NAME, ""):
-            response.set_cookie(
-                key=TOKEN_COOKIE_NAME,
-                value=API_TOKEN,
-                httponly=True,
-                secure=TOKEN_COOKIE_SECURE,
-                samesite=TOKEN_COOKIE_SAMESITE,
-                path="/",
-                max_age=60 * 60 * 24 * 30,  # 30 days
-            )
-    return response
+@app.get("/healthz", response_class=PlainTextResponse)
+def healthz():
+    return "ok"
 
-def bearer_auth(request: Request):
-    """Authorize via Authorization header OR HttpOnly cookie."""
-    if not API_TOKEN:
-        return True  # dev mode
-    # Header
-    auth = request.headers.get("Authorization") or ""
-    if auth.startswith("Bearer ") and auth.removeprefix("Bearer ").strip() == API_TOKEN:
-        return True
-    # Cookie
-    if (request.cookies.get(TOKEN_COOKIE_NAME) or "").strip() == API_TOKEN:
-        return True
-    raise HTTPException(status_code=401, detail="Missing or invalid token")
+@app.get("/ui", response_class=HTMLResponse)
+def ui():
+    return """
+<!doctype html><meta charset="utf-8"><title>toddric • Web UI</title>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<style>
+:root{--bg:#0b0c10;--panel:#12151d;--panel2:#1b1f2a;--txt:#e8eaf0;--muted:#9aa3b2;--acc:#3b65ff;--bd:#2a2e39}
+*{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--txt);font:17px/1.55 system-ui,Segoe UI,Roboto,Ubuntu}
+header{display:flex;align-items:center;gap:8px;padding:12px 16px;border-bottom:1px solid var(--bd);position:sticky;top:0;background:rgba(11,12,16,.9);backdrop-filter:saturate(120%) blur(6px)}
+header .dot{width:8px;height:8px;border-radius:50%;background:#26d07c;box-shadow:0 0 0 2px #153,0 0 10px #26d07c}
+header h1{font-size:16px;margin:0 6px 0 0;font-weight:600}
+header .flag{margin-left:auto;color:#8fc;opacity:.9}
+main{max-width:980px;margin:0 auto;padding:16px;display:flex;flex-direction:column;gap:14px;overflow-y:auto;height:70vh}
+.msg{display:flex}
+.msg .bubble{max-width:78ch;padding:12px 14px;border-radius:14px;border:1px solid var(--bd);white-space:pre-wrap;font-size:16px;line-height:1.55}
+.msg.me{justify-content:flex-end}
+.msg.me .bubble{background:var(--panel2)}
+.msg.bot .bubble{background:var(--panel)}
+.system{color:var(--muted);font-size:13px}
+footer{position:sticky;bottom:0;background:rgba(11,12,16,.95);border-top:1px solid var(--bd)}
+form{display:flex;gap:10px;padding:12px;max-width:980px;margin:0 auto;align-items:flex-end}
+textarea,button{border-radius:12px;border:1px solid var(--bd);background:#0b0e14;color:var(--txt)}
+textarea{flex:1;resize:none;height:110px;padding:12px 14px;font-size:17px;line-height:1.5}
+button{padding:12px 16px;min-width:96px;background:var(--acc);border-color:#365df0;color:#fff;font-weight:600}
+.meta{color:var(--muted);font-size:12px;margin-top:4px}
+kbd{background:#111;border:1px solid #333;border-bottom-color:#222;color:#ddd;border-radius:6px;padding:1px 6px;font-size:.85em}
+</style>
+<header>
+  <div class=dot></div><h1>toddric • Web UI</h1><span class=meta id=ready>ready</span>
+  <span class="flag meta">🇮🇪 cloudflared-ready</span>
+</header>
+<main id=log></main>
+<footer>
+  <form id=f>
+    <textarea id=msg placeholder="Type a message…  (Enter=send,  Shift+Enter=newline)"></textarea>
+    <button id=send type=submit>Send</button>
+  </form>
+  <div class=meta style="max-width:980px;margin:0 auto 10px auto;padding:0 12px">
+    Tip: press <kbd>Enter</kbd> to send, <kbd>Shift</kbd>+<kbd>Enter</kbd> for newline.
+  </div>
+</footer>
+<script>
+const $=s=>document.querySelector(s), log=$("#log"), f=$("#f"), T=$("#msg");
+function scrollToBottom(){ log.scrollTo({ top: log.scrollHeight, behavior: "smooth" }); }
+function add(role, text){
+  const d=document.createElement("div"); d.className="msg "+role;
+  const b=document.createElement("div"); b.className="bubble"; b.textContent=text;
+  d.appendChild(b); log.appendChild(d); scrollToBottom();
+}
+function sys(text){ const d=document.createElement("div"); d.className="system"; d.textContent=text; log.appendChild(d); scrollToBottom(); }
+async function send(ev){ ev&&ev.preventDefault(); const txt=T.value.trim(); if(!txt) return; T.value=""; add("me", txt);
+  const res=await fetch("/chat",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({message:txt,session_id:"web"})});
+  if(!res.ok){ add("bot","[error "+res.status+"] "+await res.text()); return; }
+  const data=await res.json(); let out=data.text||""; if(data.truncated){ out+=" …"; } add("bot", out);
+}
+T.addEventListener("keydown",e=>{ if(e.key==="Enter"&&!e.shiftKey){ send(e) }});
+f.addEventListener("submit",send);
+(async()=>{ try{ const r=await fetch("/debug/prompt"); if(r.ok){ const j=await r.json(); sys("system prompt: "+(j.system_prompt_head||"")+(j.len>240?" …":"")); } }catch{} })();
+</script>
+"""
 
-# -----------------------------------------------------------------------------
-# Rate limiting (simple, single-process)
-# -----------------------------------------------------------------------------
-RATE_LIMIT = int(os.getenv("RATE_LIMIT", "30"))
-WINDOW_SEC = int(os.getenv("WINDOW_SEC", "60"))
-_rate_state: Dict[str, tuple] = {}
+@app.get("/ui-lite", response_class=HTMLResponse)
+def ui_lite():
+    return "<p>Use <a href='/ui'>/ui</a>.</p>"
 
-def rate_limiter(request: Request):
-    ip = request.client.host if request.client else "unknown"
-    now = time.time()
-    last_ts, count = _rate_state.get(ip, (0.0, 0))
-    if now - last_ts > WINDOW_SEC:
-        count = 0
-        last_ts = now
-    count += 1
-    _rate_state[ip] = (last_ts, count)
-    if count > RATE_LIMIT:
-        raise HTTPException(status_code=429, detail="Too many requests")
-    return True
+# ──────────────────────────────────────────────────────────────────────────────
+# Chat
 
-# -----------------------------------------------------------------------------
-# STOP / START / HELP semantics
-# -----------------------------------------------------------------------------
-OPT_OUT_WORDS = {"stop", "unsubscribe", "cancel", "quit"}
-OPT_IN_WORDS  = {"start", "unstop"}
-HELP_WORDS    = {"help", "info", "support"}
+class Req(BaseModel):
+    message: str
+    session_id: Optional[str] = "web"
+    max_new_tokens: Optional[int] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
+    do_sample: Optional[bool] = None
 
-def normalize(s: str) -> str:
-    return (s or "").strip()
+class Resp(BaseModel):
+    text: str
+    used_rag: bool = False
+    provenance: Optional[Dict[str, Any]] = None
+    latency_ms: Optional[int] = None
+    truncated: Optional[bool] = None
 
-def classify_command(s: str) -> Optional[str]:
-    low = s.lower().strip()
-    if low in OPT_OUT_WORDS: return "STOP"
-    if low in OPT_IN_WORDS:  return "START"
-    if low in HELP_WORDS:    return "HELP"
-    return None
-
-# -----------------------------------------------------------------------------
-# Diagnostics + command router (whoami, /diag)
-# -----------------------------------------------------------------------------
-START_TS = time.time()
-TODDRIC_USER = os.getenv("TODDRIC_USER", "Todd J. McCaffrey")
-MODEL_PATH = os.getenv("TODDRIC_MODEL", "")
-
-def _diag():
-    return {
-        "ok": True,
-        "uptime_s": int(time.time() - START_TS),
-        "rate_limit": RATE_LIMIT,
-        "window_s": WINDOW_SEC,
-        "model": MODEL_PATH or "(unknown)",
-        "has_tc": bool(tc),
-    }
-
-def _handle_command(msg: str) -> Optional[dict]:
-    m = msg.strip()
-    low = m.lower()
-
-    if low in ("whoami", "/whoami"):
-        return {"text": f"You’re {TODDRIC_USER}."}
-
-    if low in ("/diag", "diag", "/status"):
-        return {"text": json.dumps(_diag(), indent=2)}
-
-    # Add more command hooks here as needed
-    return None
-
-# -----------------------------------------------------------------------------
-# toddric pipeline (import & shim)
-# -----------------------------------------------------------------------------
-tc = None
-try:
-    import toddric_chat as tc  # your shared engine module with top-level chat()
-except Exception:
-    tc = None
-
-def _call_toddric(message: str, session_id: str) -> dict:
-    if tc:
-        for fn_name in ("chat", "generate_reply", "handle_message", "handleMessage"):
-            fn = getattr(tc, fn_name, None)
-            if callable(fn):
-                try:
-                    res = fn(message, session_id=session_id)
-                except TypeError:
-                    res = fn(message)
-                if isinstance(res, dict):
-                    return {
-                        "text": str(res.get("text") or res.get("reply") or ""),
-                        "used_rag": bool(res.get("used_rag", False)),
-                        "provenance": res.get("provenance") or None,
-                    }
-                return {"text": str(res), "used_rag": False, "provenance": None}
-        gen = getattr(tc, "generate", None)
-        if callable(gen):
-            try:
-                out = gen(message, session_id=session_id)
-            except TypeError:
-                out = gen(message)
-            return {"text": str(out), "used_rag": False, "provenance": None}
-
-    return {"text": f"Echo: {message}", "used_rag": False, "provenance": {"source": "fallback"}}
-
-async def _stream_tokens(message: str, session_id: str) -> AsyncGenerator[str, None]:
-    if tc:
-        for attr in ("stream_generate", "stream", "stream_reply", "generate_stream"):
-            gen_fn = getattr(tc, attr, None)
-            if callable(gen_fn):
-                try:
-                    iterator = gen_fn(message, session_id=session_id)
-                except TypeError:
-                    iterator = gen_fn(message)
-                try:
-                    async for token in iterator:
-                        yield str(token)
-                    return
-                except TypeError:
-                    for token in iterator:
-                        yield str(token)
-                    return
-                except Exception:
-                    break
-    # Fallback: chunk final answer
-    res = _call_toddric(message, session_id)
-    text = res["text"]
-    for i in range(0, len(text), 20):
-        yield text[i:i+20]
-        if i % 200 == 0:
-            import asyncio; await asyncio.sleep(0)
-
-# -----------------------------------------------------------------------------
-# Routes (define BEFORE static mount)
-# -----------------------------------------------------------------------------
-@app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest,
-               _auth=Depends(bearer_auth),
-               _lim=Depends(rate_limiter)):
+@app.post("/chat", response_model=Resp)
+def chat(req: Req, _auth=Depends(_require_bearer)):
     start = time.time()
-    msg = normalize(req.message)
 
-    # SMS-like controls
-    sys_cmd = classify_command(msg)
-    if sys_cmd == "STOP":
-        return ChatResponse(text="You’ve been opted out. Send START to opt back in.",
-                            provenance={"system":"opt-out"},
-                            latency_ms=int((time.time()-start)*1000))
-    if sys_cmd == "START":
-        return ChatResponse(text="You’re opted in. Ask me anything.",
-                            provenance={"system":"opt-in"},
-                            latency_ms=int((time.time()-start)*1000))
-    if sys_cmd == "HELP":
-        return ChatResponse(text="toddric help: HELP, STOP, START.",
-                            provenance={"system":"help"},
-                            latency_ms=int((time.time()-start)*1000))
+    # Log session start once
+    if not hasattr(app.state, "seen_sessions"):
+        app.state.seen_sessions = set()
+    if req.session_id not in app.state.seen_sessions:
+        app.state.seen_sessions.add(req.session_id)
+        log_session_start(req.session_id or "web", _cfg.SYSTEM_PROMPT, _cfg)
 
-    # Web commands (whoami, /diag, etc.)
-    cmd_reply = _handle_command(msg)
-    if cmd_reply is not None:
-        return ChatResponse(text=cmd_reply["text"],
-                            provenance={"system":"command"},
-                            latency_ms=int((time.time()-start)*1000))
+    eng = _get_engine()
+    try:
+        res = eng.chat(
+            req.message, session_id=req.session_id,
+            max_new_tokens=req.max_new_tokens,
+            temperature=req.temperature,
+            top_p=req.top_p, top_k=req.top_k,
+            do_sample=req.do_sample,
+            repetition_penalty=_cfg.REP_PEN,
+        )
+        if isinstance(res, dict):
+            text = str(res.get("text") or res.get("reply") or "")
+            used_rag = bool(res.get("used_rag", False))
+            provenance = res.get("provenance")
+        else:
+            text, used_rag, provenance = str(res), False, None
 
-    # Model path
-    result = _call_toddric(msg, req.session_id)
-    latency = int((time.time() - start) * 1000)
-    return ChatResponse(text=result["text"],
-                        used_rag=bool(result.get("used_rag", False)),
-                        provenance=result.get("provenance"),
-                        latency_ms=latency)
+        truncated = len(text) > 0 and text[-1] not in ".!?”’\""
+        latency = int((time.time() - start) * 1000)
 
-# SSE: 2-step (POST stores, GET streams) — matches optional streaming UI flow
-_pending: Dict[str, str] = {}
+        # Log turn
+        log_turn(req.session_id or "web", req.message, text, {
+            "latency_ms": latency,
+            "used_rag": used_rag,
+            "truncated": truncated,
+            "engine": "toddric_chat-or-minimal",
+            "model_resolved": _cfg.MODEL_DIR or _cfg.MODEL_ID,
+        })
 
-@app.post("/chat/stream")
-async def prepare_stream(req: ChatRequest,
-                         _auth=Depends(bearer_auth),
-                         _lim=Depends(rate_limiter)):
-    _pending[req.session_id] = normalize(req.message)
-    return JSONResponse({"ok": True})
+        return Resp(text=text, used_rag=used_rag, provenance=provenance,
+                    latency_ms=latency, truncated=truncated)
 
-def _sse_event(data: str) -> bytes:
-    return f"data: {data}\n\n".encode("utf-8")
+    except HTTPException:
+        raise
+    except Exception as e:
+        return JSONResponse(status_code=500,
+            content={"error": "chat_failed", "detail": repr(e)})
 
-@app.get("/chat/stream")
-async def stream(session_id: str,
-                 request: Request,
-                 _auth=Depends(bearer_auth),
-                 _lim=Depends(rate_limiter)):
-    message = _pending.pop(session_id, "")
-    if not message:
-        raise HTTPException(status_code=400, detail="No pending message for this session_id")
+# ──────────────────────────────────────────────────────────────────────────────
+# Debug
 
-    async def event_gen() -> AsyncGenerator[bytes, None]:
-        try:
-            async for token in _stream_tokens(message, session_id):
-                yield _sse_event(token)
-            yield _sse_event("[DONE]")
-        except Exception as e:
-            yield _sse_event(f'{{"error":"{str(e)}"}}')
+@app.get("/debug/model")
+def debug_model():
+    mid = _cfg.MODEL_DIR or _cfg.MODEL_ID
+    out: Dict[str, Any] = {"env_MODEL_ID": _cfg.MODEL_ID, "env_MODEL_DIR": _cfg.MODEL_DIR, "resolved": mid}
+    try:
+        if AutoConfig is not None:
+            conf = AutoConfig.from_pretrained(mid, trust_remote_code=True)
+            out.update({
+                "model_type": getattr(conf, "model_type", None),
+                "architectures": getattr(conf, "architectures", None),
+                "hidden_size": getattr(conf, "hidden_size", None),
+                "vocab_size": getattr(conf, "vocab_size", None),
+            })
+    except Exception as e:
+        out["config_error"] = repr(e)
+    try:
+        p = pathlib.Path(mid)
+        out["source"] = "local_dir" if p.exists() else "hub"
+        if p.exists():
+            out["files_present"] = sorted([q.name for q in p.glob("*")][:12])
+    except Exception:
+        pass
+    return out
 
-    return StreamingResponse(event_gen(), media_type="text/event-stream")
-
-@app.get("/healthz")
-async def healthz():
-    return {"ok": True, "ts": time.time()}
-
-# -----------------------------------------------------------------------------
-# Static UI (served LAST). Put index.html in ./public
-# -----------------------------------------------------------------------------
-@app.middleware("http")
-async def add_cache_headers(request: Request, call_next):
-    response: Response = await call_next(request)
-    path = request.url.path
-    # Cache assets; keep index.html uncached for easy deploys
-    if any(path.startswith(p) for p in ("/assets", "/static")) or "." in path:
-        response.headers.setdefault("Cache-Control", "public, max-age=604800, immutable")
-    return response
-
-app.mount("/", StaticFiles(directory="public", html=True), name="ui")
+@app.get("/debug/prompt")
+def debug_prompt():
+    s = _cfg.SYSTEM_PROMPT or ""
+    return {"system_prompt_head": s[:240], "len": len(s)}
 
