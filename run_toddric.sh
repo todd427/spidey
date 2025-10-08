@@ -6,6 +6,14 @@ set -euo pipefail
 export TORCH_DEVICE=cuda
 export DEVICE_MAP=auto
 export TORCH_DTYPE=bfloat16   # or: float16
+# env or CLI flags for your server/eval
+export MAX_NEW_TOKENS=64
+export TEMPERATURE=0.0
+export TOP_P=0.9
+export TOP_K=40
+export DO_SAMPLE=0        # use greedy for crisp answers
+export REPETITION_PENALTY=1.15
+
 
 APP_MODULE="${APP_MODULE:-app_toddric:app}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
@@ -102,5 +110,5 @@ export TORCH_DEVICE="${TORCH_DEVICE:-auto}"
 export ALLOW_NO_AUTH="${ALLOW_NO_AUTH:-1}"
 
 echo "[run] ${APP_MODULE} on http://${HOST}:${PORT}  (model: ${MODEL_DIR:-$MODEL_ID})"
-exec uvicorn "$APP_MODULE" --host "$HOST" --port "$PORT"
+exec uvicorn "$APP_MODULE" --host "$HOST" --port "$PORT" --reload
 

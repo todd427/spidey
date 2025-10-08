@@ -200,7 +200,7 @@ def _compat_cfg_for_chatengine():
     return Compat(preset)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Engine adapter (persona hardening)
+# Engine adapter (no persona injection here; engines handle it)
 
 def _engine_adapter(obj):
     class Adapter:
@@ -224,10 +224,8 @@ def _engine_adapter(obj):
                  top_k: Optional[int] = None,
                  do_sample: Optional[bool] = None,
                  repetition_penalty: Optional[float] = None):
-            persona = os.getenv("SYSTEM_PROMPT_PREFIX", _cfg.SYSTEM_PROMPT).strip()
-            if persona:
-                message = f"{persona}\n\nUser: {message}\nAssistant:"
-
+            # Important: DO NOT prepend persona text here.
+            # MinimalEngine (and ChatEngine if present) will add the system prompt correctly.
             kwargs = {}
             if max_new_tokens is not None: kwargs["max_new_tokens"] = max_new_tokens
             if temperature    is not None: kwargs["temperature"]    = temperature
@@ -303,6 +301,21 @@ def _build_minimal_engine():
             K = top_k          if top_k          is not None else _cfg.TOP_K
             S = do_sample      if do_sample      is not None else _cfg.DO_SAMPLE
             R = repetition_penalty if repetition_penalty is not None else _cfg.REP_PEN
+            # after we compute M,T,P,K,S,R and before generate():
+            stops = ["\n\nUser:", "\nUser:", "\n###", "\n\n[TODDRIC]"]
+            stop_ids = tok.convert_tokens_to_ids([tok.eos_token])  # ensure EOS is there
+
+            out = lm.generate(
+                ids,
+                attention_mask=attn,
+                max_new_tokens=M,
+                do_sample=S,
+                temperature=T,
+                top_p=P,
+                top_k=K,
+                repetition_penalty=R,
+                eos_token_id=tok.eos_token_id,
+            )
 
             try:
                 msgs = [{"role":"system","content": system},
@@ -310,6 +323,7 @@ def _build_minimal_engine():
                 ids = tok.apply_chat_template(msgs, add_generation_prompt=True,
                                               return_tensors="pt", padding=True)
             except Exception:
+                # Fallback (no chat template available)
                 prompt = f"{system}\n\nUser: {message}\nAssistant:"
                 ids = tok(prompt, return_tensors="pt").input_ids
             attn = (ids != tok.pad_token_id).long()
@@ -323,6 +337,28 @@ def _build_minimal_engine():
                     repetition_penalty=R,
                 )
             text = tok.decode(out[0], skip_special_tokens=True)
+            # existing: text = tok.decode(out[0], skip_special_tokens=True)
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            
+            # If it turns into a questionnaire (3+ question lines), keep the first sentence only.
+            if sum(ln.endswith("?") for ln in lines) >= 3:
+                first = lines[0]
+                # truncate at first sentence end if present
+                for dot in (". ", "! ", "? "):
+                    if dot in first:
+                        first = first.split(dot, 1)[0] + dot.strip()
+                        break
+                text = first
+
+            # keep concise
+            if len(text) > 360:
+                text = text[:360].rstrip() + "…"
+
+            # Trim accidental echoes of the system prompt (rare, but tidy).
+            sys_head = system.strip()[:120]
+            if sys_head and text.strip().startswith(sys_head):
+                text = text.split("\n", 1)[-1].strip()
+
             for tag in ("<|assistant|>", "Assistant:", "assistant\n"):
                 if tag in text:
                     text = text.split(tag)[-1].strip()
