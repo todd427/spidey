@@ -215,11 +215,12 @@ async def chat(payload: Dict[str, Any]):
     alog.info(f"[{req_id}] OK {out['latency_ms']}ms")
     return JSONResponse(out)
 
+from starlette.responses import JSONResponse
+
 @app.get("/debug/prompt")
 def debug_prompt():
     sys = os.getenv("SYSTEM_PROMPT", "") or getattr(get_engine(), "system_prompt", "")
-    sys = sys or ""
-    head = sys[:240]
+    head = (sys[:160] + "…") if len(sys) > 160 else sys
     return JSONResponse({"system_prompt_head": head, "len": len(sys)})
 
 @app.get("/debug/static")

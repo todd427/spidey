@@ -97,6 +97,24 @@ def _render_recipe_md(rec: Recipe) -> str:
             out.append(f"- {n}")
     return "\n".join(out)
 
+def _read_text_file(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return ""
+
+def _resolve_path(p: str) -> str:
+    if os.path.isabs(p):
+        return p
+    # try CWD, then alongside this file, then repo-root-ish
+    here = os.path.dirname(os.path.abspath(__file__))
+    for base in (os.getcwd(), here, os.path.dirname(here)):
+        cand = os.path.join(base, p)
+        if os.path.exists(cand):
+            return cand
+    return p  # let it fail later if truly missing
+
 JSON_GUARD = (
     "You are a careful chef-bot. Output ONLY valid JSON that conforms to the schema. "
     "No markdown fences or commentary—JSON ONLY."
@@ -267,7 +285,15 @@ class ChatEngine:
         self.tokenizer.padding_side = "left"
 
         # ---- prompts / modes ----
-        self.system_prompt = os.getenv("SYSTEM_PROMPT", "").strip()
+        # System prompt: prefer file, then env, else empty
+        sp_file = os.getenv("SYSTEM_PROMPT_FILE", "").strip()
+        system_prompt = ""
+        if sp_file:
+            system_prompt = _read_text_file(_resolve_path(sp_file)).strip()
+        if not system_prompt:
+            system_prompt = (os.getenv("SYSTEM_PROMPT", "") or "").strip()
+        self.system_prompt = system_prompt
+
         self.chat_template = os.getenv("CHAT_TEMPLATE") or None
         if self.chat_template and "{user}" not in self.chat_template:
             self.chat_template = None
