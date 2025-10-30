@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8" />
+<title>toddric • Web UI</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<link rel="stylesheet" href="/static/ui.css?v={{ APP_VERSION }}" />
+<body>
+  <header>
+    <div class="dot"></div>
+    <h1>toddric • Web UI</h1>
+    <span class="meta" id="ready">ready</span>
+    <button id="reset" type="button" style="margin-left:8px">New chat</button>
+    <span class="flag meta">🇮🇪 cloudflared-ready</span>
+  </header>
+
+  <main id="log"></main>
+
+  <footer>
+    <form id="f">
+      <textarea id="msg" placeholder="Type a message…  (Shift+Enter=send,  Enter=newline)"></textarea>
+      <button id="send" type="submit">Send</button>
+    </form>
+    <div class="meta">
+      <div class="footer-info">
+        <div><span class="label">system prompt:</span><span id="system-prompt">loading…</span></div>
+        <div class="tip">Tip: <kbd>Shift</kbd>+<kbd>Enter</kbd> sends • <kbd>Enter</kbd> adds a newline.</div>
+      </div>
+    </div>
+  </footer>
+
+  <script src="/static/ui.js?v={{ APP_VERSION }}"></script>
+</body>
+</html>

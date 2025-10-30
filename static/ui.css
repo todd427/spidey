@@ -1,0 +1,32 @@
+:root{--bg:#0b0c10;--panel:#12151d;--panel2:#1b1f2a;--txt:#e8eaf0;--muted:#9aa3b2;--acc:#3b65ff;--bd:#2a2e39}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--txt);font:17px/1.55 system-ui,Segoe UI,Roboto,Ubuntu}
+/* ...rest of your CSS from before... */
+:root{--bg:#0b0c10;--panel:#12151d;--panel2:#1b1f2a;--txt:#e8eaf0;--muted:#9aa3b2;--acc:#3b65ff;--bd:#2a2e39}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--txt);font:17px/1.55 system-ui,Segoe UI,Roboto,Ubuntu}
+/* ...rest of your CSS from before... */
+
+:root{--bg:#0b0c10;--panel:#12151d;--panel2:#1b1f2a;--txt:#e8eaf0;--muted:#9aa3b2;--acc:#3b65ff;--bd:#2a2e39}
+*{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--txt);font:17px/1.55 system-ui,Segoe UI,Roboto,Ubuntu}
+header{display:flex;align-items:center;gap:8px;padding:12px 16px;border-bottom:1px solid var(--bd);position:sticky;top:0;background:rgba(11,12,16,.9);backdrop-filter:saturate(120%) blur(6px)}
+header .dot{width:8px;height:8px;border-radius:50%;background:#26d07c;box-shadow:0 0 0 2px #153,0 0 10px #26d07c}
+header h1{font-size:16px;margin:0 6px 0 0;font-weight:600}
+header .flag{margin-left:auto;color:#8fc;opacity:.9}
+main{max-width:980px;margin:0 auto;padding:16px;display:flex;flex-direction:column;gap:14px;overflow-y:auto;height:70vh}
+.msg{display:flex}
+.msg .bubble{max-width:78ch;padding:12px 14px;border-radius:14px;border:1px solid var(--bd);white-space:pre-wrap;font-size:16px;line-height:1.55}
+.msg.me{justify-content:flex-end}
+.msg.me .bubble{background:var(--panel2)}
+.msg.bot .bubble{background:var(--panel)}
+.system{color:var(--muted);font-size:13px}
+footer{position:sticky;bottom:0;background:rgba(11,12,16,.95);border-top:1px solid var(--bd)}
+form{display:flex;gap:10px;padding:12px;max-width:980px;margin:0 auto;align-items:flex-end}
+textarea,button{border-radius:12px;border:1px solid var(--bd);background:#0b0e14;color:var(--txt)}
+textarea{flex:1;resize:none;height:110px;padding:12px 14px;font-size:17px;line-height:1.5}
+button{padding:12px 16px;min-width:96px;background:var(--acc);border-color:#365df0;color:#fff;font-weight:600}
+.meta{color:var(--muted);font-size:12px;margin:6px auto 10px auto;max-width:980px;padding:0 12px}
+kbd{background:#111;border:1px solid #333;border-bottom-color:#222;color:#ddd;border-radius:6px;padding:1px 6px;font-size:.85em}
+#reset{background:#2e7d32;border-color:#246428}
+.footer-info{display:flex;gap:12px;flex-wrap:wrap}
+.footer-info .label{opacity:.7;margin-right:4px}

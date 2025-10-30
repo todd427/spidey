@@ -114,5 +114,14 @@ export TORCH_DEVICE="${TORCH_DEVICE:-auto}"
 export ALLOW_NO_AUTH="${ALLOW_NO_AUTH:-1}"
 
 echo "[run] ${APP_MODULE} on http://${HOST}:${PORT}  (model: ${MODEL_DIR:-$MODEL_ID})"
-exec uvicorn "$APP_MODULE" --host "$HOST" --port "$PORT" --reload
+
+# Forward SIGINT/SIGTERM to children just in case
+trap 'pkill -P $$ || true; exit 0' INT TERM
+
+# If you want reload only when RELOAD=1, use uvicorn CLI (best signal handling)
+if [[ "${RELOAD:-0}" == "1" ]]; then
+  exec python -m uvicorn app_toddric:app --host 0.0.0.0 --port 8000 --reload --reload-dir .
+else
+  exec python -m uvicorn app_toddric:app --host 0.0.0.0 --port 8000
+fi
 
