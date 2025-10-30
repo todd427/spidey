@@ -35,24 +35,25 @@ def _load_system_prompt() -> str:
         "Always prefix replies with [TODDRIC]. "
         "You are Toddric — pragmatic, nerdy, playful, and wise. Speak plainly, avoid fluff. "
         "Push back gently on falsehoods; explain the correction. Prefer 3–6 tight sentences. "
-        "If uncertain, say 'Not sure.' Use tools (RAG, Memory, Location, Weather) when helpful. "
-        "Label speculation."
+        "When the user asks a question, answer it directly in 1–3 sentences. "
+        "Do not respond with a list of questions. Ask at most one clarifying question only if the request is ambiguous. "
+        "If uncertain, say 'Not sure.' Label speculation."
     )
 
 @dataclass
 class Cfg:
-    MODEL_ID: str = os.getenv("MODEL_ID", "toddie314/toddric-1_5b-merged-v1")
+    MODEL_ID: str = os.getenv("MODEL_ID", "toddie314/toddric-llama-8B-merged-v1")
     MODEL_DIR: Optional[str] = os.getenv("MODEL_DIR") or None
     MODEL_REV: str = os.getenv("MODEL_REV", "main")
     TORCH_DEVICE: str = os.getenv("TORCH_DEVICE", "auto")
     SYSTEM_PROMPT: str = _load_system_prompt()
-    # decoding defaults
-    MAX_NEW_TOKENS: int = int(os.getenv("MAX_NEW_TOKENS", "512"))
-    TEMPERATURE: float = float(os.getenv("TEMPERATURE", "0.7"))
-    TOP_P: float = float(os.getenv("TOP_P", "0.95"))
-    TOP_K: int = int(os.getenv("TOP_K", "50"))
-    DO_SAMPLE: bool = os.getenv("DO_SAMPLE", "1") not in ("0", "false", "False")
-    REP_PEN: float = float(os.getenv("REPETITION_PENALTY", "1.12"))
+    # decoding defaults (conservative MVP)
+    MAX_NEW_TOKENS: int = int(os.getenv("MAX_NEW_TOKENS", "64"))
+    TEMPERATURE: float = float(os.getenv("TEMPERATURE", "0.0"))
+    TOP_P: float = float(os.getenv("TOP_P", "0.9"))
+    TOP_K: int = int(os.getenv("TOP_K", "40"))
+    DO_SAMPLE: bool = os.getenv("DO_SAMPLE", "0") not in ("0", "false", "False")
+    REP_PEN: float = float(os.getenv("REPETITION_PENALTY", "1.15"))
 
 _cfg = Cfg()
 print(f"[toddric] MODEL_ID={_cfg.MODEL_ID}  MODEL_DIR={_cfg.MODEL_DIR}  REV={_cfg.MODEL_REV}")
@@ -62,7 +63,7 @@ print(f"[toddric] SYSTEM head={_cfg.SYSTEM_PROMPT[:96]!r}")
 # Auth
 
 API_TOKEN = os.getenv("TODDRIC_BEARER", "").strip()
-ALLOW_NO_AUTH = os.getenv("ALLOW_NO_AUTH", "0") in ("1", "true", "True")
+ALLOW_NO_AUTH = os.getenv("ALLOW_NO_AUTH", "1") in ("1", "true", "True")  # default open for local dev
 
 def _require_bearer(request: Request):
     if ALLOW_NO_AUTH:
@@ -153,7 +154,7 @@ def log_turn(session_id: str, user_text: str, assistant_text: str, meta: dict):
 # ──────────────────────────────────────────────────────────────────────────────
 # FastAPI app
 
-app = FastAPI(title="Spidey / Toddric", version="1.8")
+app = FastAPI(title="Spidey / Toddric", version="1.9")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.middleware("http")
@@ -224,8 +225,6 @@ def _engine_adapter(obj):
                  top_k: Optional[int] = None,
                  do_sample: Optional[bool] = None,
                  repetition_penalty: Optional[float] = None):
-            # Important: DO NOT prepend persona text here.
-            # MinimalEngine (and ChatEngine if present) will add the system prompt correctly.
             kwargs = {}
             if max_new_tokens is not None: kwargs["max_new_tokens"] = max_new_tokens
             if temperature    is not None: kwargs["temperature"]    = temperature
@@ -295,73 +294,67 @@ def _build_minimal_engine():
                  top_k: Optional[int] = None,
                  do_sample: Optional[bool] = None,
                  repetition_penalty: Optional[float] = None):
+            # Resolve decoding params
             M = max_new_tokens if max_new_tokens is not None else _cfg.MAX_NEW_TOKENS
             T = temperature    if temperature    is not None else _cfg.TEMPERATURE
             P = top_p          if top_p          is not None else _cfg.TOP_P
             K = top_k          if top_k          is not None else _cfg.TOP_K
             S = do_sample      if do_sample      is not None else _cfg.DO_SAMPLE
             R = repetition_penalty if repetition_penalty is not None else _cfg.REP_PEN
-            # after we compute M,T,P,K,S,R and before generate():
-            stops = ["\n\nUser:", "\nUser:", "\n###", "\n\n[TODDRIC]"]
-            stop_ids = tok.convert_tokens_to_ids([tok.eos_token])  # ensure EOS is there
 
-            out = lm.generate(
-                ids,
-                attention_mask=attn,
-                max_new_tokens=M,
-                do_sample=S,
-                temperature=T,
-                top_p=P,
-                top_k=K,
-                repetition_penalty=R,
-                eos_token_id=tok.eos_token_id,
-            )
-
+            # Build prompt (chat template if available)
             try:
-                msgs = [{"role":"system","content": system},
-                        {"role":"user","content": message}]
-                ids = tok.apply_chat_template(msgs, add_generation_prompt=True,
-                                              return_tensors="pt", padding=True)
+                msgs = [{"role": "system", "content": system},
+                        {"role": "user",   "content": message}]
+                ids = tok.apply_chat_template(
+                    msgs, add_generation_prompt=True,
+                    return_tensors="pt", padding=True
+                )
             except Exception:
-                # Fallback (no chat template available)
                 prompt = f"{system}\n\nUser: {message}\nAssistant:"
                 ids = tok(prompt, return_tensors="pt").input_ids
+
             attn = (ids != tok.pad_token_id).long()
             ids, attn = ids.to(device), attn.to(device)
 
+            # Generate (eos stop + deterministic by default)
             with torch.no_grad():
                 out = lm.generate(
-                    ids, attention_mask=attn,
-                    max_new_tokens=M, do_sample=S,
-                    temperature=T, top_p=P, top_k=K,
+                    ids,
+                    attention_mask=attn,
+                    max_new_tokens=M,
+                    do_sample=S,
+                    temperature=T,
+                    top_p=P,
+                    top_k=K,
                     repetition_penalty=R,
+                    eos_token_id=tok.eos_token_id,
                 )
+
             text = tok.decode(out[0], skip_special_tokens=True)
-            # existing: text = tok.decode(out[0], skip_special_tokens=True)
-            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-            
-            # If it turns into a questionnaire (3+ question lines), keep the first sentence only.
-            if sum(ln.endswith("?") for ln in lines) >= 3:
-                first = lines[0]
-                # truncate at first sentence end if present
-                for dot in (". ", "! ", "? "):
-                    if dot in first:
-                        first = first.split(dot, 1)[0] + dot.strip()
-                        break
-                text = first
 
-            # keep concise
-            if len(text) > 360:
-                text = text[:360].rstrip() + "…"
-
-            # Trim accidental echoes of the system prompt (rare, but tidy).
+            # Tidy: remove echoed system or role tags
             sys_head = system.strip()[:120]
             if sys_head and text.strip().startswith(sys_head):
                 text = text.split("\n", 1)[-1].strip()
-
             for tag in ("<|assistant|>", "Assistant:", "assistant\n"):
                 if tag in text:
                     text = text.split(tag)[-1].strip()
+
+            # Questionnaire clamp: if it devolves into a list of questions, keep only the first sentence
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            if sum(ln.endswith("?") for ln in lines) >= 3:
+                first = lines[0]
+                for end in (". ", "! ", "? "):
+                    if end in first:
+                        first = first.split(end, 1)[0] + end.strip()
+                        break
+                text = first
+
+            # Hard brevity cap (MVP)
+            if len(text) > 360:
+                text = text[:360].rstrip() + "…"
+
             return {"text": text, "used_rag": False}
 
         def stream(self, message: str, session_id: str = "default", **_):
@@ -442,9 +435,11 @@ textarea{flex:1;resize:none;height:110px;padding:12px 14px;font-size:17px;line-h
 button{padding:12px 16px;min-width:96px;background:var(--acc);border-color:#365df0;color:#fff;font-weight:600}
 .meta{color:var(--muted);font-size:12px;margin-top:4px}
 kbd{background:#111;border:1px solid #333;border-bottom-color:#222;color:#ddd;border-radius:6px;padding:1px 6px;font-size:.85em}
+#reset{background:#2e7d32;border-color:#246428}
 </style>
 <header>
   <div class=dot></div><h1>toddric • Web UI</h1><span class=meta id=ready>ready</span>
+  <button id=reset type=button style="margin-left:8px">New chat</button>
   <span class="flag meta">🇮🇪 cloudflared-ready</span>
 </header>
 <main id=log></main>
@@ -458,7 +453,7 @@ kbd{background:#111;border:1px solid #333;border-bottom-color:#222;color:#ddd;bo
   </div>
 </footer>
 <script>
-const $=s=>document.querySelector(s), log=$("#log"), f=$("#f"), T=$("#msg");
+const $=s=>document.querySelector(s), log=$("#log"), f=$("#f"), T=$("#msg"), resetBtn=$("#reset");
 function scrollToBottom(){ log.scrollTo({ top: log.scrollHeight, behavior: "smooth" }); }
 function add(role, text){
   const d=document.createElement("div"); d.className="msg "+role;
@@ -466,14 +461,20 @@ function add(role, text){
   d.appendChild(b); log.appendChild(d); scrollToBottom();
 }
 function sys(text){ const d=document.createElement("div"); d.className="system"; d.textContent=text; log.appendChild(d); scrollToBottom(); }
+
+// rotate session id for true fresh starts
+let session = crypto.randomUUID();
+resetBtn.addEventListener("click", ()=>{ session = crypto.randomUUID(); log.innerHTML=""; sys("new chat started"); });
+
 async function send(ev){ ev&&ev.preventDefault(); const txt=T.value.trim(); if(!txt) return; T.value=""; add("me", txt);
   const res=await fetch("/chat",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({message:txt,session_id:"web"})});
+    body:JSON.stringify({message:txt,session_id:session})});
   if(!res.ok){ add("bot","[error "+res.status+"] "+await res.text()); return; }
   const data=await res.json(); let out=data.text||""; if(data.truncated){ out+=" …"; } add("bot", out);
 }
 T.addEventListener("keydown",e=>{ if(e.key==="Enter"&&!e.shiftKey){ send(e) }});
 f.addEventListener("submit",send);
+
 (async()=>{ try{ const r=await fetch("/debug/prompt"); if(r.ok){ const j=await r.json(); sys("system prompt: "+(j.system_prompt_head||"")+(j.len>240?" …":"")); } }catch{} })();
 </script>
 """
@@ -532,7 +533,6 @@ def chat(req: Req, _auth=Depends(_require_bearer)):
         truncated = len(text) > 0 and text[-1] not in ".!?”’\""
         latency = int((time.time() - start) * 1000)
 
-        # Log turn
         log_turn(req.session_id or "web", req.message, text, {
             "latency_ms": latency,
             "used_rag": used_rag,

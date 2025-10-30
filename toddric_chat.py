@@ -1,10 +1,11 @@
 # toddric_chat.py
 # Chat engine wrapper for spidey/Toddric.
-# - Model env precedence: MODEL_NAME > TODDRIC_MODEL > MODEL > default HF id
+# - Prefers chat() with real chat formatting; generate() also works.
+# - Model env precedence: MODEL_ID > MODEL_NAME > TODDRIC_MODEL > MODEL > default HF id
 # - HF auth: uses HUGGINGFACE_HUB_TOKEN / HF_TOKEN; only "login" if HF_TOKEN isn't already set
 # - dtype compatibility: prefers dtype=... (new), falls back to torch_dtype=... (old); if auto, passes nothing
 # - Optional 4/8-bit quant (requires CUDA + bitsandbytes; otherwise ignored)
-# - Minimal chat() API returning dict with text + metadata
+# - System prompt pulled from SYSTEM_PROMPT (optional)
 
 from __future__ import annotations
 
@@ -25,7 +26,8 @@ log = logging.getLogger("uvicorn.error")
 # -----------------------------
 
 def _resolve_model() -> str:
-    for key in ("MODEL_NAME", "TODDRIC_MODEL", "MODEL"):
+    # Be generous about env names we accept
+    for key in ("MODEL_ID", "MODEL_NAME", "TODDRIC_MODEL", "MODEL"):
         val = os.getenv(key)
         if val and val.strip():
             return val.strip()
@@ -118,8 +120,7 @@ class ChatEngine:
         # Token for private/gated repos
         self.hf_token = os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
 
-        # Make token globally visible for hub utilities (e.g., list_repo_tree) ONLY if HF_TOKEN isn't already set.
-        # This avoids the "HF_TOKEN is current active token" warning.
+        # Make token globally visible for hub utilities ONLY if HF_TOKEN isn't already set.
         if self.hf_token and not os.getenv("HF_TOKEN"):
             try:
                 from huggingface_hub import login, HfFolder
@@ -142,6 +143,14 @@ class ChatEngine:
             token=self.hf_token,
         )
 
+        # Be explicit about padding to avoid odd left/right truncation and echoes
+        if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.padding_side = "left"
+
+        # System prompt (optional)
+        self.system_prompt = os.getenv("SYSTEM_PROMPT", "").strip()
+
         # Prepare load kwargs
         load_kwargs: Dict[str, Any] = dict(
             trust_remote_code=cfg.trust_remote_code,
@@ -150,8 +159,6 @@ class ChatEngine:
         )
 
         # ---------- dtype compatibility shim ----------
-        # If dtype == "auto": pass no dtype kw (most compatible).
-        # Else, resolve torch.<dtype> and try dtype=... (new); on TypeError fallback to torch_dtype=... (old).
         resolved_dtype = None
         if cfg.dtype and cfg.dtype != "auto":
             try:
@@ -207,7 +214,7 @@ class ChatEngine:
             eos_token_id=self._eos_id(),
         )
 
-        # Prompt template
+        # Optional plain string template fallback (rarely needed now)
         self.chat_template = os.getenv("CHAT_TEMPLATE") or None
         if self.chat_template and "{user}" not in self.chat_template:
             self.chat_template = None
@@ -217,6 +224,8 @@ class ChatEngine:
             f"dtype={cfg.dtype} max_new={cfg.max_new_tokens} temp={cfg.temperature} "
             f"top_p={cfg.top_p} top_k={cfg.top_k} do_sample={cfg.do_sample}"
         )
+
+    # ---- internals ----
 
     def _pad_id(self) -> int:
         if self.tokenizer.pad_token_id is not None:
@@ -228,32 +237,82 @@ class ChatEngine:
     def _eos_id(self) -> Optional[int]:
         return self.tokenizer.eos_token_id
 
-    def _format_prompt(self, message: str, history: Optional[List[Dict[str, str]]] = None) -> str:
-        if self.chat_template:
-            return self.chat_template.replace("{user}", message)
-        if history:
-            convo = ""
-            for turn in history[-6:]:
-                role = turn.get("role", "user")
-                content = turn.get("content", "")
-                convo += f"{role}: {content}\n"
-            convo += f"user: {message}\nassistant:"
-            return convo
-        return f"User: {message}\nAssistant:"
+    def _build_prompt(self, message: str, history: Optional[List[Dict[str, str]]] = None) -> str:
+        """
+        Prefer real chat templates if tokenizer supports them; else use a robust string fallback.
+        """
+        # Try native chat template
+        try:
+            msgs: List[Dict[str, str]] = []
+            if self.system_prompt:
+                msgs.append({"role": "system", "content": self.system_prompt})
+            if history:
+                msgs.extend(history[-6:])
+            msgs.append({"role": "user", "content": message})
+            return self.tokenizer.apply_chat_template(
+                msgs, add_generation_prompt=True, tokenize=False
+            )
+        except Exception:
+            # Fallback path
+            if self.chat_template:
+                return self.chat_template.replace("{user}", message)
+            sys = f"System: {self.system_prompt}\n" if self.system_prompt else ""
+            return f"{sys}User: {message}\nAssistant:"
+
+    # ---- public generation methods ----
 
     @torch.inference_mode()
-    def generate(self, prompt: str) -> str:
+    def generate(self, prompt: str, **overrides) -> str:
+        """
+        Text generation on a prepared prompt. Supports override of gen kwargs.
+        """
+        gen = dict(self.gen_kwargs)
+        # allow adapter to pass decoding knobs through
+        for k, v in overrides.items():
+            if v is not None:
+                gen[k] = v
+
         inputs = self.tokenizer(prompt, return_tensors="pt")
         inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
-        outputs = self.model.generate(**inputs, **self.gen_kwargs)
+        outputs = self.model.generate(**inputs, **gen)
         text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+        # Strip echoed prompt (handles both raw and "User:/Assistant:" forms)
         if text.startswith(prompt):
             text = text[len(prompt):].lstrip()
+        for tag in ("Assistant:", "assistant:", "<|assistant|>"):
+            i = text.find(tag)
+            if i != -1:
+                text = text[i + len(tag):].lstrip()
+                break
         return text.strip()
+
+    def chat(
+        self,
+        message: str,
+        session_id: Optional[str] = None,
+        history: Optional[List[Dict[str, str]]] = None,
+        **gen_overrides,
+    ) -> Dict[str, Any]:
+        """
+        Primary entry point expected by the FastAPI app.
+        """
+        t0 = time.time()
+        prompt = self._build_prompt(message, history=history)
+        reply = self.generate(prompt, **gen_overrides)
+        latency_ms = int((time.time() - t0) * 1000)
+        return {
+            "text": reply,
+            "used_rag": False,
+            "provenance": None,
+            "latency_ms": latency_ms,
+            "model": self.cfg.model,
+            "session_id": session_id,
+        }
 
 
 # ----------------
-# Public interface
+# Module-level API
 # ----------------
 
 _engine: Optional[ChatEngine] = None
@@ -269,17 +328,7 @@ def _get_engine() -> ChatEngine:
 
 
 def chat(message: str, session_id: Optional[str] = None) -> Dict[str, Any]:
-    t0 = time.time()
+    # Back-compat shim if something imports chat() directly
     eng = _get_engine()
-    prompt = eng._format_prompt(message)
-    reply = eng.generate(prompt)
-    latency_ms = int((time.time() - t0) * 1000)
-    return {
-        "text": reply,
-        "used_rag": False,
-        "provenance": None,
-        "latency_ms": latency_ms,
-        "model": eng.cfg.model,
-        "session_id": session_id,
-    }
+    return eng.chat(message=message, session_id=session_id)
 

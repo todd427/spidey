@@ -16,6 +16,10 @@ bin/
 cache/
 dist/
 build/
+log/
+core/
+models/
+model/
 *.egg
 
 # Logs and databases
@@ -28,3 +32,21 @@ models/
 .vscode/
 .idea/
 *.swp
+.env.1_5b
+.env.old
+.hf-cache/
+.venv/
+czech.sh
+logs/
+makekey.sh
+pipped
+prompts/
+public.off/
+redownload.sh
+set_bear.sh
+spidey.py
+run_toddric2.sh
+system_toddric.md
+to_sft.py
+
+

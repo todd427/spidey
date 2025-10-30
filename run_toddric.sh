@@ -92,6 +92,10 @@ else
 fi
 
 # -------- model --------
+if [[ -f $MODEL_DIR/config.json ]]; then
+	NO_DOWNLOAD=1
+fi
+echo "NO_DOWNLOAD is: " $NO_DOWNLOAD
 if [[ "$NO_DOWNLOAD" != "1" ]]; then
   if [[ -x ./get_model.sh ]]; then
     ./get_model.sh "$MODEL_ID" "$MODEL_DIR" "$MODEL_REV"
