@@ -391,10 +391,13 @@ class ChatEngine:
     def _build_prompt(self, message: str, history: Optional[List[Dict[str, str]]] = None) -> str:
         try:
             msgs: List[Dict[str, str]] = []
-            if self.system_prompt:
-                msgs.append({"role": "system", "content": self.system_prompt})
+            #if self.system_prompt:
+            #    msgs.append({"role": "system", "content": self.system_prompt})
             if history:
                 msgs.extend(history[-6:])
+            style = "Answer directly. No role-play. No 'User:'/'Assistant:' tags."
+            msgs.append({"role": "system", "content": style})
+
             msgs.append({"role": "user", "content": message})
             return self.tokenizer.apply_chat_template(
                 msgs, add_generation_prompt=True, tokenize=False
