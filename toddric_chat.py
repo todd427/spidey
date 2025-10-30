@@ -1,4 +1,5 @@
-# toddric_chat.py — Chat engine with recipe mode, strict validation, warmup, and speed-friendly defaults.
+# toddric_chat.py — Chat engine with recipe mode, strict validation, warmup,
+# SDPA (new API), and warning-free generation args.
 
 from __future__ import annotations
 
@@ -314,15 +315,20 @@ class ChatEngine:
         self.model.eval()
 
         # ---- generation defaults (set BEFORE warmup) ----
-        self.gen_kwargs = dict(
+        # Keep base (greedy-safe) defaults separate from sampling-only knobs.
+        self.gen_base = dict(
             max_new_tokens=self.cfg.max_new_tokens,
-            temperature=self.cfg.temperature,
-            top_p=self.cfg.top_p,
-            top_k=self.cfg.top_k,
             do_sample=self.cfg.do_sample,
             repetition_penalty=self.cfg.repetition_penalty,
             pad_token_id=self._pad_id(),
             eos_token_id=self._eos_id(),
+            top_k=self.cfg.top_k,  # harmless for greedy, but we’ll prune when off
+            # Note: temperature/top_p are added only if sampling -> see generate()
+        )
+        self.sample_defaults = dict(
+            temperature=self.cfg.temperature,
+            top_p=self.cfg.top_p,
+            top_k=self.cfg.top_k,
         )
 
         # Warmup thread (speeds up first responses)
@@ -333,8 +339,8 @@ class ChatEngine:
 
         log.info(
             f"[toddric_chat] Loaded model ok. bits={cfg.bits} trust_remote_code={cfg.trust_remote_code} "
-            f"dtype={cfg.dtype} max_new={cfg.max_new_tokens} temp={cfg.temperature} "
-            f"top_p={cfg.top_p} top_k={cfg.top_k} do_sample={cfg.do_sample}"
+            f"dtype={cfg.dtype} max_new={cfg.max_new_tokens} temp={self.cfg.temperature} "
+            f"top_p={self.cfg.top_p} top_k={self.cfg.top_k} do_sample={self.cfg.do_sample}"
         )
 
     # ---- warmup --------------------------------------------------------------
@@ -365,9 +371,8 @@ class ChatEngine:
     def _sdp_ctx(self):
         """
         Prefer the new torch.nn.attention.sdpa_kernel() API (PyTorch 2.5+).
-        Fall back to torch.backends.cuda.sdp_kernel() if needed, else no-op.
+        If unavailable, do nothing (avoid deprecated torch.backends.cuda.sdp_kernel()).
         """
-        # New API (PyTorch 2.5+)
         try:
             from torch.nn.attention import sdpa_kernel, SDPBackend
             return sdpa_kernel(
@@ -376,13 +381,8 @@ class ChatEngine:
                 SDPBackend.MATH,
             )
         except Exception:
-            # Old API (deprecated)
-            try:
-                from torch.backends.cuda import sdp_kernel
-                return sdp_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=True)
-            except Exception:
-                from contextlib import nullcontext
-                return nullcontext()
+            from contextlib import nullcontext
+            return nullcontext()
 
     def _build_prompt(self, message: str, history: Optional[List[Dict[str, str]]] = None) -> str:
         try:
@@ -451,23 +451,42 @@ class ChatEngine:
     # ---- public generation ---------------------------------------------------
     @torch.inference_mode()
     def generate(self, prompt: str, **overrides) -> str:
-        gen = dict(self.gen_kwargs)
+        # Start from base defaults and apply overrides
+        gen: Dict[str, Any] = dict(self.gen_base)
         for k, v in overrides.items():
             if v is not None:
                 gen[k] = v
 
-        # Guard: sampling requires temperature > 0
+        # Decide final sampling mode
+        do_sample = bool(gen.get("do_sample", False))
         temp = gen.get("temperature", None)
+
+        # If user asked for temp<=0, force greedy
         if temp is not None and temp <= 0:
+            do_sample = False
+
+        # Compose final kwargs:
+        # - if sampling: ensure temperature/top_p present (from overrides or defaults)
+        # - if greedy: remove sampling-only keys so Transformers doesn't warn
+        if do_sample:
+            # Merge sampling defaults only if not explicitly provided
+            for k, v in self.sample_defaults.items():
+                gen.setdefault(k, v)
+            # Ensure positive temperature
+            if gen.get("temperature", 1.0) <= 0:
+                gen["temperature"] = 1.0
+        else:
             gen["do_sample"] = False
-            # Optional: drop temperature altogether for greedy
-            # gen.pop("temperature", None)
+            for k in ("temperature", "top_p", "top_k"):
+                gen.pop(k, None)
 
         inputs = self.tokenizer(prompt, return_tensors="pt")
         inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
-        # Fresh SDP context each call (fix for single-use GeneratorContextManager)
+
+        # Fresh SDPA context each call (uses new API if present; otherwise no-op)
         with self._sdp_ctx():
             outputs = self.model.generate(**inputs, **gen)
+
         text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
 
         # strip echoed prompt / tags
