@@ -1,5 +1,5 @@
 # toddric_chat.py — Chat engine with recipe mode, strict validation, warmup,
-# SDPA (new API), greedy-fast recipes, and warning-free generation args.
+# SDPA (new API), greedy-fast recipes, boundary-smart endings, and warning-free generation args.
 
 from __future__ import annotations
 
@@ -23,6 +23,26 @@ try:
     torch.set_float32_matmul_precision("high")
 except Exception:
     pass
+
+# -----------------------------
+# Sentence boundary helpers
+# -----------------------------
+SENT_END_RE = re.compile(
+    r"""(?s)
+    (.*?                                   # everything up to...
+      [\.!\?…]                             # a sentence end
+      (?:['"”’\)\]]+)?                     # optional closing quotes/brackets
+    )\s*$""",
+    re.VERBOSE,
+)
+
+def _trim_to_sentence(text: str) -> str:
+    text = text.strip()
+    m = SENT_END_RE.match(text)
+    return m.group(1).strip() if m else text
+
+def _looks_complete(text: str) -> bool:
+    return bool(SENT_END_RE.match(text.strip()))
 
 # -----------------------------
 # Recipe schema + helpers
@@ -172,6 +192,9 @@ def _env_default(name: str, default: str) -> str:
     v = os.getenv(name)
     return v if v is not None else default
 
+# -----------------------------
+# Engine config
+# -----------------------------
 @dataclass
 class EngineConfig:
     model: str
@@ -243,7 +266,7 @@ class ChatEngine:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "left"
 
-        # ---- prompts / modes (set BEFORE warmup) ----
+        # ---- prompts / modes ----
         self.system_prompt = os.getenv("SYSTEM_PROMPT", "").strip()
         self.chat_template = os.getenv("CHAT_TEMPLATE") or None
         if self.chat_template and "{user}" not in self.chat_template:
@@ -319,8 +342,7 @@ class ChatEngine:
 
         self.model.eval()
 
-        # ---- generation defaults (set BEFORE warmup) ----
-        # Keep base (greedy-safe) defaults separate from sampling-only knobs.
+        # ---- generation defaults ----
         self.gen_base = dict(
             max_new_tokens=self.cfg.max_new_tokens,
             do_sample=self.cfg.do_sample,
@@ -335,7 +357,7 @@ class ChatEngine:
             top_k=self.cfg.top_k,
         )
 
-        # Warmup thread (speeds up first responses)
+        # Warmup thread (speeds first response)
         self._did_warmup = False
         if _env_bool("WARMUP", True):
             import threading
@@ -373,10 +395,7 @@ class ChatEngine:
         return self.tokenizer.eos_token_id
 
     def _sdp_ctx(self):
-        """
-        Prefer the new torch.nn.attention.sdpa_kernel() API (PyTorch 2.5+).
-        If unavailable, do nothing (avoid deprecated torch.backends.cuda.sdp_kernel()).
-        """
+        """Prefer torch.nn.attention.sdpa_kernel() (PyTorch 2.5+); else no-op."""
         try:
             from torch.nn.attention import sdpa_kernel, SDPBackend
             return sdpa_kernel(
@@ -391,13 +410,12 @@ class ChatEngine:
     def _build_prompt(self, message: str, history: Optional[List[Dict[str, str]]] = None) -> str:
         try:
             msgs: List[Dict[str, str]] = []
-            #if self.system_prompt:
-            #    msgs.append({"role": "system", "content": self.system_prompt})
+            # Lightweight style guardrail to avoid role-play prefixes.
+            msgs.append({"role": "system", "content": "Answer directly. No role-play. No 'User:'/'Assistant:' tags."})
+            if self.system_prompt:
+                msgs.append({"role": "system", "content": self.system_prompt})
             if history:
                 msgs.extend(history[-6:])
-            style = "Answer directly. No role-play. No 'User:'/'Assistant:' tags."
-            msgs.append({"role": "system", "content": style})
-
             msgs.append({"role": "user", "content": message})
             return self.tokenizer.apply_chat_template(
                 msgs, add_generation_prompt=True, tokenize=False
@@ -470,14 +488,9 @@ class ChatEngine:
         # Decide final sampling mode
         do_sample = bool(gen.get("do_sample", False))
         temp = gen.get("temperature", None)
-
-        # If user asked for temp<=0, force greedy
         if temp is not None and temp <= 0:
             do_sample = False
 
-        # Compose final kwargs:
-        # - if sampling: ensure temperature/top_p present (from overrides or defaults)
-        # - if greedy: remove sampling-only keys so Transformers doesn't warn
         if do_sample:
             for k, v in self.sample_defaults.items():
                 gen.setdefault(k, v)
@@ -488,16 +501,18 @@ class ChatEngine:
             for k in ("temperature", "top_p", "top_k"):
                 gen.pop(k, None)
 
+        max_new = int(gen.get("max_new_tokens", 256))
+
         inputs = self.tokenizer(prompt, return_tensors="pt")
         inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+        in_len = int(inputs["input_ids"].shape[-1])
 
-        # Fresh SDPA context each call (uses new API if present; otherwise no-op)
+        # First pass
         with self._sdp_ctx():
-            outputs = self.model.generate(**inputs, **gen)
+            out = self.model.generate(**inputs, **gen)
+        text = self.tokenizer.decode(out[0], skip_special_tokens=True)
 
-        text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-        # strip echoed prompt / tags
+        # Remove echoed prompt / role tags
         if text.startswith(prompt):
             text = text[len(prompt):].lstrip()
         for tag in ("Assistant:", "assistant:", "<|assistant|>"):
@@ -505,19 +520,50 @@ class ChatEngine:
             if i != -1:
                 text = text[i + len(tag):].lstrip()
                 break
+        text = text.strip()
+
+        # Heuristic: did we likely hit the cap?
+        out_len = int(out.shape[-1])
+        gen_tokens = max(0, out_len - in_len)
+        near_cap = gen_tokens >= max_new - 2
+        complete = _looks_complete(text)
+
+        # If we clipped at the cap and have no sentence ending, ask for a tiny continuation.
+        if near_cap and not complete:
+            cont_prompt = f"{prompt}{text}"
+            cont_inputs = self.tokenizer(cont_prompt, return_tensors="pt")
+            cont_inputs = {k: v.to(self.model.device) for k, v in cont_inputs.items()}
+
+            cont_kwargs = dict(gen)
+            cont_kwargs["max_new_tokens"] = min(24, max(8, max_new // 10))
+            cont_kwargs["do_sample"] = False
+            for k in ("temperature", "top_p", "top_k"):
+                cont_kwargs.pop(k, None)
+
+            with self._sdp_ctx():
+                out2 = self.model.generate(**cont_inputs, **cont_kwargs)
+            more = self.tokenizer.decode(out2[0], skip_special_tokens=True)
+
+            if more.startswith(cont_prompt):
+                more = more[len(cont_prompt):].lstrip()
+            text = (text + " " + more.strip()).strip()
+
+        # Final neat trim to last full sentence if still messy
+        if not _looks_complete(text):
+            text = _trim_to_sentence(text)
 
         # perf note: tokens/sec
         try:
             out_ids = self.tokenizer(text, return_tensors=None)["input_ids"]
-            in_len = int(inputs["input_ids"].shape[-1])
-            gen_tokens = max(0, len(out_ids) - in_len)
             dt = time.time() - t_start
             if dt > 0:
-                log.info(f"[toddric_chat] gen tokens={gen_tokens}  dt={dt:.2f}s  rate={gen_tokens/dt:.1f} tok/s")
+                # approximate gen tokens (post-trim)
+                approx_gen = max(0, len(out_ids) - in_len)
+                log.info(f"[toddric_chat] gen tokens≈{approx_gen}  dt={dt:.2f}s  rate≈{max(1,approx_gen)/max(dt,1e-6):.1f} tok/s")
         except Exception:
             pass
 
-        return text.strip()
+        return text
 
     def chat(
         self,

@@ -38,4 +38,22 @@ kbd{background:#111;border:1px solid #333;border-bottom-color:#222;color:#ddd;bo
 #status.ready { color: #86efac; }      /* green */
 #status.sending { color: #93c5fd; }    /* blue-ish */
 #status.error { color: #fca5a5; }      /* red-ish */
+/* Wrap bot/user content nicely */
+#log .bubble pre {
+  white-space: pre-wrap;      /* keep newlines, allow wrapping */
+  word-break: break-word;     /* break long words/URLs if needed */
+  overflow-wrap: anywhere;    /* modern fallback for very long tokens */
+  overflow-x: hidden;         /* no horizontal scrollbar */
+}
+
+/* Optional: also wrap the textarea’s content as you type */
+#msg {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* (If you still see a scrollbar on the bubble container) */
+#log .bubble {
+  overflow-x: hidden;
+}
 
