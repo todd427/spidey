@@ -1,5 +1,5 @@
 # toddric_chat.py — Chat engine with recipe mode, strict validation, warmup,
-# SDPA (new API), and warning-free generation args.
+# SDPA (new API), greedy-fast recipes, and warning-free generation args.
 
 from __future__ import annotations
 
@@ -168,6 +168,10 @@ def _env_float(name: str, default: float) -> float:
     except Exception:
         return default
 
+def _env_default(name: str, default: str) -> str:
+    v = os.getenv(name)
+    return v if v is not None else default
+
 @dataclass
 class EngineConfig:
     model: str
@@ -245,6 +249,7 @@ class ChatEngine:
         if self.chat_template and "{user}" not in self.chat_template:
             self.chat_template = None
         self.recipe_autodetect = _env_bool("RECIPE_AUTODETECT", True)
+        self.recipe_max_new = int(_env_default("RECIPE_MAX_NEW", "240"))  # fast recipes
 
         load_kwargs: Dict[str, Any] = dict(
             trust_remote_code=cfg.trust_remote_code,
@@ -322,8 +327,7 @@ class ChatEngine:
             repetition_penalty=self.cfg.repetition_penalty,
             pad_token_id=self._pad_id(),
             eos_token_id=self._eos_id(),
-            top_k=self.cfg.top_k,  # harmless for greedy, but we’ll prune when off
-            # Note: temperature/top_p are added only if sampling -> see generate()
+            top_k=self.cfg.top_k,  # harmless for greedy, pruned when off
         )
         self.sample_defaults = dict(
             temperature=self.cfg.temperature,
@@ -421,7 +425,8 @@ class ChatEngine:
             f"Return JSON:"
         )
         p1 = self._build_prompt(first)
-        raw = self.generate(p1, temperature=0.2, max_new_tokens=800)
+        # greedy + capped length => fast and deterministic
+        raw = self.generate(p1, temperature=0.0, max_new_tokens=self.recipe_max_new, do_sample=False)
 
         try:
             obj = json.loads(_extract_json(raw))
@@ -439,7 +444,7 @@ class ChatEngine:
                 f"Error: {e1}\n\nReturn corrected JSON only."
             )
             p2 = self._build_prompt(fix)
-            raw2 = self.generate(p2, temperature=0.0, max_new_tokens=700, do_sample=False)
+            raw2 = self.generate(p2, temperature=0.0, max_new_tokens=self.recipe_max_new, do_sample=False)
             obj2 = json.loads(_extract_json(raw2))
             rec2 = Recipe.model_validate(obj2)
             _validate_terms(rec2, terms)
@@ -451,6 +456,8 @@ class ChatEngine:
     # ---- public generation ---------------------------------------------------
     @torch.inference_mode()
     def generate(self, prompt: str, **overrides) -> str:
+        t_start = time.time()
+
         # Start from base defaults and apply overrides
         gen: Dict[str, Any] = dict(self.gen_base)
         for k, v in overrides.items():
@@ -469,10 +476,8 @@ class ChatEngine:
         # - if sampling: ensure temperature/top_p present (from overrides or defaults)
         # - if greedy: remove sampling-only keys so Transformers doesn't warn
         if do_sample:
-            # Merge sampling defaults only if not explicitly provided
             for k, v in self.sample_defaults.items():
                 gen.setdefault(k, v)
-            # Ensure positive temperature
             if gen.get("temperature", 1.0) <= 0:
                 gen["temperature"] = 1.0
         else:
@@ -497,6 +502,18 @@ class ChatEngine:
             if i != -1:
                 text = text[i + len(tag):].lstrip()
                 break
+
+        # perf note: tokens/sec
+        try:
+            out_ids = self.tokenizer(text, return_tensors=None)["input_ids"]
+            in_len = int(inputs["input_ids"].shape[-1])
+            gen_tokens = max(0, len(out_ids) - in_len)
+            dt = time.time() - t_start
+            if dt > 0:
+                log.info(f"[toddric_chat] gen tokens={gen_tokens}  dt={dt:.2f}s  rate={gen_tokens/dt:.1f} tok/s")
+        except Exception:
+            pass
+
         return text.strip()
 
     def chat(

@@ -30,3 +30,12 @@ kbd{background:#111;border:1px solid #333;border-bottom-color:#222;color:#ddd;bo
 #reset{background:#2e7d32;border-color:#246428}
 .footer-info{display:flex;gap:12px;flex-wrap:wrap}
 .footer-info .label{opacity:.7;margin-right:4px}
+/* quick bubble styling */
+.bubble { max-width: 720px; margin: 10px 16px; padding: 12px 16px; border-radius: 14px; white-space: pre-wrap; line-height: 1.35; }
+.bubble.user { margin-left: auto; background: #2b2f3a; color: #eee; border-top-right-radius: 6px; }
+.bubble.bot  { margin-right: auto; background: #121417; color: #e6e6e6; border-top-left-radius: 6px; }
+
+#status.ready { color: #86efac; }      /* green */
+#status.sending { color: #93c5fd; }    /* blue-ish */
+#status.error { color: #fca5a5; }      /* red-ish */
+
