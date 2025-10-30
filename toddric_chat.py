@@ -1,54 +1,129 @@
-# toddric_chat.py — Chat engine with recipe mode, strict validation, warmup,
-# SDPA (new API), greedy-fast recipes, boundary-smart endings, and warning-free generation args.
+# toddric_chat.py — routed decoding (rank/howto/creative/general),
+# on-topic guard, answer contract shaping, warmup, SDPA, and file-based system prompt.
 
 from __future__ import annotations
 
-import os
-import re
-import time
-import json
-import unicodedata
-import logging
+import os, re, time, json, logging, unicodedata
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
 
 import torch
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 log = logging.getLogger("uvicorn.error")
 
-# Prefer fast matmul (TF32 on Ampere+ / modern GPUs)
 try:
     torch.set_float32_matmul_precision("high")
 except Exception:
     pass
 
-# -----------------------------
-# Sentence boundary helpers
-# -----------------------------
-SENT_END_RE = re.compile(
-    r"""(?s)
-    (.*?                                   # everything up to...
-      [\.!\?…]                             # a sentence end
-      (?:['"”’\)\]]+)?                     # optional closing quotes/brackets
-    )\s*$""",
-    re.VERBOSE,
-)
+# ---------- small helpers ----------
+def _read_text_file(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return ""
+
+def _resolve_path(p: str) -> str:
+    if os.path.isabs(p):
+        return p
+    here = os.path.dirname(os.path.abspath(__file__))
+    for base in (os.getcwd(), here, os.path.dirname(here)):
+        cand = os.path.join(base, p)
+        if os.path.exists(cand):
+            return cand
+    return p
+
+def _has_meta_tensors(model) -> bool:
+    try:
+        for p in model.parameters():
+            if getattr(p, "device", None) and str(p.device) == "meta":
+                return True
+        for b in getattr(model, "buffers", lambda: [])():
+            if getattr(b, "device", None) and str(b.device) == "meta":
+                return True
+    except Exception:
+        pass
+    return False
+
+def _env_bool(name: str, default: bool=True) -> bool:
+    v = os.getenv(name)
+    if v is None: return default
+    return str(v).strip().lower() not in ("0","false","no","off")
+
+def _env_int(name: str, default: int) -> int:
+    try: return int(os.getenv(name, default))
+    except Exception: return default
+
+def _env_float(name: str, default: float) -> float:
+    try: return float(os.getenv(name, default))
+    except Exception: return default
+
+def _norm(s: str) -> str:
+    return unicodedata.normalize("NFKC", s).strip()
+
+# ---------- boundary helpers ----------
+SENT_END_RE = re.compile(r'(?s)(.*?[.!?…](?:[)"\]’”]+)?)(\s+|$)')
 
 def _trim_to_sentence(text: str) -> str:
-    text = text.strip()
-    m = SENT_END_RE.match(text)
-    return m.group(1).strip() if m else text
+    t = text.strip()
+    m = SENT_END_RE.match(t)
+    return m.group(1).strip() if m else t
 
 def _looks_complete(text: str) -> bool:
     return bool(SENT_END_RE.match(text.strip()))
 
-# -----------------------------
-# Recipe schema + helpers
-# -----------------------------
+# ---------- intent routing ----------
+def intent_of(q: str) -> str:
+    ql = q.lower()
+    if any(p in ql for p in ["best ", " top ", "which is the best", "rank ", " vs ", "compare "]):
+        return "rank"
+    if any(p in ql for p in ["how to", "how do i", "steps", "recipe", "ingredients", "make "]):
+        return "howto"
+    if any(p in ql for p in ["ideas", "brainstorm", "alternatives", "taglines", "slogans", "creative"]):
+        return "creative"
+    return "general"
+
+def gen_params_for(intent: str) -> Dict[str, Any]:
+    if intent in ("rank", "general"):
+        return dict(do_sample=False, max_new_tokens=192)
+    if intent == "howto":
+        return dict(do_sample=False, max_new_tokens=320)
+    # creative
+    return dict(do_sample=True, temperature=0.8, top_p=0.9, top_k=50, max_new_tokens=220)
+
+TOPIC_WORDS = [
+    "champagne","sparkling","garlic","beef","windows","domain","azure","ireland",
+    "pricing","security","donegal","letterkenny","python","django","huggingface"
+]
+
+def enforce_topic(user_q: str, answer: str, engine) -> str:
+    lower_q = user_q.lower()
+    must = [w for w in TOPIC_WORDS if w in lower_q]
+    if must and not any(w in answer.lower() for w in must):
+        fix = f"Answer directly about: {', '.join(must)}. Do not change the topic."
+        tiny = engine._build_prompt(fix + "\n\n" + user_q)
+        return _trim_to_sentence(engine.generate(tiny, do_sample=False, max_new_tokens=64))
+    return answer
+
+def enforce_contract(ans: str, kind: str) -> str:
+    ans = ans.strip()
+    for tag in ("User:", "Assistant:", "assistant:", "<|assistant|>"):
+        if ans.startswith(tag): ans = ans[len(tag):].lstrip()
+    if kind == "rank":
+        lines = [ln for ln in ans.splitlines() if ln.strip()]
+        if len(lines) <= 1:
+            parts = re.split(r"[;•]\s*", _trim_to_sentence(ans))
+            lines = [p for p in parts if p.strip()]
+        lines = lines[:5]
+        return "\n".join(f"- {ln.lstrip('-• ').strip()}" for ln in lines)
+    return _trim_to_sentence(ans)
+
+# ---------- recipe JSON (optional) ----------
 class Ingredient(BaseModel):
-    qty: Optional[str] = Field(None, description="Human-friendly, e.g., '1 cup' or '450 g'")
+    qty: Optional[str] = None
     item: str
     notes: Optional[str] = None
 
@@ -60,26 +135,17 @@ class Recipe(BaseModel):
     steps: List[str]
     notes: Optional[List[str]] = None
 
-def _norm(s: str) -> str:
-    return unicodedata.normalize("NFKC", s.lower()).strip()
-
 def _extract_json(text: str) -> str:
     m = re.search(r"\{.*\}", text, flags=re.S)
-    if not m:
-        raise ValueError("No JSON object found in model output.")
+    if not m: raise ValueError("No JSON object found.")
     return m.group(0)
 
-def _ingredients_appear_in_steps(rec: Recipe) -> List[str]:
-    steps_blob = _norm(" ".join(rec.steps))
-    return [i.item for i in rec.ingredients if _norm(i.item) not in steps_blob]
-
 def _render_recipe_md(rec: Recipe) -> str:
-    out: List[str] = [rec.title]
+    out = [rec.title]
     meta = []
     if rec.servings: meta.append(f"Serves {rec.servings}")
     if rec.total_time: meta.append(rec.total_time)
-    if meta:
-        out.append(" • ".join(meta))
+    if meta: out.append(" • ".join(meta))
     out.append("")
     out.append("Ingredients")
     for it in rec.ingredients:
@@ -93,133 +159,23 @@ def _render_recipe_md(rec: Recipe) -> str:
     if rec.notes:
         out.append("")
         out.append("Notes")
-        for n in rec.notes:
-            out.append(f"- {n}")
+        out += [f"- {n}" for n in rec.notes]
     return "\n".join(out)
 
-def _read_text_file(path: str) -> str:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read()
-    except Exception:
-        return ""
-
-def _resolve_path(p: str) -> str:
-    if os.path.isabs(p):
-        return p
-    # try CWD, then alongside this file, then repo-root-ish
-    here = os.path.dirname(os.path.abspath(__file__))
-    for base in (os.getcwd(), here, os.path.dirname(here)):
-        cand = os.path.join(base, p)
-        if os.path.exists(cand):
-            return cand
-    return p  # let it fail later if truly missing
-
-JSON_GUARD = (
-    "You are a careful chef-bot. Output ONLY valid JSON that conforms to the schema. "
-    "No markdown fences or commentary—JSON ONLY."
-)
-
-RECIPE_INSTR = """Create a complete, coherent recipe as JSON with fields:
-- title (string)
-- servings (string, optional)
-- total_time (string, optional)
-- ingredients (array of objects: qty (string|nullable), item (string), notes (string|nullable))
-- steps (array of strings)
-- notes (array of strings, optional)
-
-Rules (strict):
-- Match the user's request exactly: if the user specifies a dish or ingredient (e.g., "garlic beef"),
-  the recipe TITLE must include those words and the INGREDIENTS must include them.
-- Do NOT change the primary protein; never substitute chicken for beef, etc.
-- Every food mentioned in steps MUST appear in ingredients (same wording).
-- No nutrition panels, no brands, home-kitchen amounts only (metric or US).
-"""
-
-# -----------------------------
-# Required-term extraction & validation
-# -----------------------------
-PROTEINS = {
-    "beef","chicken","pork","lamb","turkey","tofu","tempeh","mushroom","fish","salmon","shrimp"
-}
-
-def _required_terms_from_request(text: str) -> List[str]:
-    t = _norm(text)
-    words = {w.strip(",.!?;:") for w in t.split()}
-    req: List[str] = []
-    req += [p for p in PROTEINS if p in words]
-    for w in ("garlic","ginger","onion","pepper","rice","noodles","stir-fry","curry","tacos","soup","beef","chicken"):
-        if w in t:
-            req.append(w)
-    seen=set(); out=[]
-    for w in req:
-        if w not in seen:
-            out.append(w); seen.add(w)
-    return out
-
-def _validate_terms(rec: Recipe, terms: List[str]) -> None:
-    title = _norm(rec.title)
-    ing_blob = _norm(" ".join(i.item for i in rec.ingredients))
-    for term in terms:
-        if term in PROTEINS:
-            if term not in title:
-                raise ValueError(f"title must include protein '{term}'")
-            if term not in ing_blob:
-                raise ValueError(f"ingredients must include protein '{term}'")
-        else:
-            if term in {"garlic","ginger","onion","pepper","rice","noodles"} and term not in ing_blob:
-                raise ValueError(f"ingredients must include '{term}'")
-    req_proteins = [t for t in terms if t in PROTEINS]
-    if req_proteins:
-        banned = (PROTEINS - set(req_proteins))
-        for b in banned:
-            if b in title or b in ing_blob:
-                raise ValueError(f"conflicting protein '{b}' present")
-
-# -----------------------------
-# Env helpers
-# -----------------------------
+# ---------- config ----------
 def _resolve_model() -> str:
-    for key in ("MODEL_ID", "MODEL_NAME", "TODDRIC_MODEL", "MODEL"):
-        val = os.getenv(key)
-        if val and val.strip():
-            return val.strip()
+    for k in ("MODEL_ID","MODEL_NAME","TODDRIC_MODEL","MODEL"):
+        v = os.getenv(k)
+        if v and v.strip(): return v.strip()
     return "toddie314/toddric-1_5b-merged-v1"
 
-def _env_bool(name: str, default: bool = True) -> bool:
-    val = os.getenv(name)
-    if val is None:
-        return default
-    return str(val).strip().lower() not in ("0", "false", "no")
-
-def _env_int(name: str, default: int) -> int:
-    val = os.getenv(name)
-    try:
-        return int(val) if val is not None else default
-    except Exception:
-        return default
-
-def _env_float(name: str, default: float) -> float:
-    val = os.getenv(name)
-    try:
-        return float(val) if val is not None else default
-    except Exception:
-        return default
-
-def _env_default(name: str, default: str) -> str:
-    v = os.getenv(name)
-    return v if v is not None else default
-
-# -----------------------------
-# Engine config
-# -----------------------------
 @dataclass
 class EngineConfig:
     model: str
     trust_remote_code: bool = True
-    bits: Optional[int] = None        # 4, 8, or None
+    bits: Optional[int] = None
     device_map: str = "auto"
-    dtype: Optional[str] = "auto"     # "auto" or "bfloat16"/"float16"
+    dtype: Optional[str] = "auto"
     max_new_tokens: int = 256
     temperature: float = 0.7
     top_p: float = 0.95
@@ -229,24 +185,15 @@ class EngineConfig:
 
     @classmethod
     def from_env(cls) -> "EngineConfig":
-        model = _resolve_model()
-        trust = _env_bool("TRUST_REMOTE_CODE", True)
-
-        bits_env = os.getenv("BITS") or os.getenv("TODDRIC_BITS")
         bits = None
-        if bits_env and bits_env.strip().isdigit():
-            b = int(bits_env)
-            if b in (4, 8):
-                bits = b
-
-        dtype = (os.getenv("DTYPE") or os.getenv("TORCH_DTYPE") or "auto").strip().lower()
-
+        b = os.getenv("BITS") or os.getenv("TODDRIC_BITS")
+        if b and b.isdigit(): bits = int(b)
         return cls(
-            model=model,
-            trust_remote_code=trust,
-            bits=bits,
+            model=_resolve_model(),
+            trust_remote_code=_env_bool("TRUST_REMOTE_CODE", True),
+            bits=bits if bits in (4,8) else None,
             device_map="auto",
-            dtype=dtype,
+            dtype=os.getenv("DTYPE") or os.getenv("TORCH_DTYPE") or "auto",
             max_new_tokens=_env_int("MAX_NEW_TOKENS", 256),
             temperature=_env_float("TEMPERATURE", 0.7),
             top_p=_env_float("TOP_P", 0.95),
@@ -255,392 +202,214 @@ class EngineConfig:
             do_sample=_env_bool("DO_SAMPLE", True),
         )
 
-# -------------
-# Chat Engine
-# -------------
+# ---------- engine ----------
 class ChatEngine:
     def __init__(self, cfg: EngineConfig):
         self.cfg = cfg
         log.info(f"[toddric_chat] Resolving model: {cfg.model}")
 
-        self.hf_token = os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
-        if self.hf_token and not os.getenv("HF_TOKEN"):
-            try:
-                from huggingface_hub import login, HfFolder
-                HfFolder.save_token(self.hf_token)
-                login(self.hf_token, add_to_git_credential=False)
-                log.info("[toddric_chat] Hugging Face token saved and session logged in.")
-            except Exception as e:
-                log.warning(f"[toddric_chat] HF login/save token failed: {e}")
+        # system prompt: prefer file, else env
+        sp_file = _resolve_path(os.getenv("SYSTEM_PROMPT_FILE","").strip())
+        sys_prompt = _read_text_file(sp_file).strip() if sp_file else ""
+        if not sys_prompt:
+            sys_prompt = (os.getenv("SYSTEM_PROMPT","") or "").strip()
+        self.system_prompt = sys_prompt
 
-        _ = AutoConfig.from_pretrained(
-            cfg.model, trust_remote_code=cfg.trust_remote_code, token=self.hf_token
-        )
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            cfg.model, trust_remote_code=cfg.trust_remote_code, use_fast=True, token=self.hf_token
-        )
-
+        # tokenizer/model
+        _ = AutoConfig.from_pretrained(cfg.model, trust_remote_code=cfg.trust_remote_code)
+        self.tokenizer = AutoTokenizer.from_pretrained(cfg.model, trust_remote_code=cfg.trust_remote_code, use_fast=True)
         if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "left"
 
-        # ---- prompts / modes ----
-        # System prompt: prefer file, then env, else empty
-        sp_file = os.getenv("SYSTEM_PROMPT_FILE", "").strip()
-        system_prompt = ""
-        if sp_file:
-            system_prompt = _read_text_file(_resolve_path(sp_file)).strip()
-        if not system_prompt:
-            system_prompt = (os.getenv("SYSTEM_PROMPT", "") or "").strip()
-        self.system_prompt = system_prompt
+        load_kwargs: Dict[str, Any] = dict(trust_remote_code=cfg.trust_remote_code, device_map=cfg.device_map, low_cpu_mem_usage=True)
+        if torch.cuda.is_available():
+            load_kwargs["attn_implementation"] = os.getenv("ATTN_IMPL","sdpa")
 
-        self.chat_template = os.getenv("CHAT_TEMPLATE") or None
-        if self.chat_template and "{user}" not in self.chat_template:
-            self.chat_template = None
-        self.recipe_autodetect = _env_bool("RECIPE_AUTODETECT", True)
-        self.recipe_max_new = int(_env_default("RECIPE_MAX_NEW", "240"))  # fast recipes
-
-        load_kwargs: Dict[str, Any] = dict(
-            trust_remote_code=cfg.trust_remote_code,
-            device_map=cfg.device_map,
-            low_cpu_mem_usage=True,
-        )
-        if self.hf_token:
-            load_kwargs["token"] = self.hf_token
-
-        # dtype shim
         resolved_dtype = None
         if cfg.dtype and cfg.dtype != "auto":
-            try:
-                resolved_dtype = getattr(torch, cfg.dtype)
-            except Exception:
-                resolved_dtype = None
+            resolved_dtype = getattr(torch, cfg.dtype, None)
 
-        # bitsandbytes if available + CUDA
-        if cfg.bits in (4, 8) and torch.cuda.is_available():
+        if cfg.bits in (4,8) and torch.cuda.is_available():
             try:
                 import bitsandbytes as _  # noqa
-                if cfg.bits == 4:
-                    load_kwargs.update(dict(load_in_4bit=True))
-                elif cfg.bits == 8:
-                    load_kwargs.update(dict(load_in_8bit=True))
+                if cfg.bits == 4: load_kwargs["load_in_4bit"]=True
+                if cfg.bits == 8: load_kwargs["load_in_8bit"]=True
             except Exception as e:
-                log.warning(f"[toddric_chat] bitsandbytes not available; ignoring BITS={cfg.bits} ({e})")
+                log.warning(f"[toddric_chat] bnb unavailable: {e}")
 
-        # --- Choose attention backend safely ---
-        attn_env = os.getenv("ATTN_IMPL")  # "flash_attention_2", "sdpa", "eager"
-        if attn_env:
-            load_kwargs["attn_implementation"] = attn_env
-            log.info(f"[toddric_chat] attn_implementation set via env: {attn_env}")
-        else:
-            if torch.cuda.is_available():
-                load_kwargs["attn_implementation"] = "sdpa"
-                log.info("[toddric_chat] Using attn_implementation='sdpa'")
+        # allow env overrides for device map / low_cpu_mem
+        device_map_env = os.getenv("DEVICE_MAP", "").strip()
+        if device_map_env:
+            load_kwargs["device_map"] = device_map_env
+        low_cpu_mem = os.getenv("LOW_CPU_MEM", None)
+        if low_cpu_mem is not None:
+            load_kwargs["low_cpu_mem_usage"] = str(low_cpu_mem).strip().lower() not in ("0","false","no","off")
 
-        # Try BetterTransformer fast-path (optional)
-        self._bt_enabled = False
-        try:
-            from optimum.bettertransformer import BetterTransformer
-            self._bt_transform = BetterTransformer.transform
-        except Exception:
-            self._bt_transform = None
-
-        # ---- Load model (respect dtype if provided) ----
         if resolved_dtype is not None:
             try:
                 self.model = AutoModelForCausalLM.from_pretrained(cfg.model, dtype=resolved_dtype, **load_kwargs)
-            except TypeError as e:
-                if "dtype" in str(e):
-                    self.model = AutoModelForCausalLM.from_pretrained(cfg.model, torch_dtype=resolved_dtype, **load_kwargs)
-                else:
-                    raise
+            except TypeError:
+                self.model = AutoModelForCausalLM.from_pretrained(cfg.model, torch_dtype=resolved_dtype, **load_kwargs)
         else:
             self.model = AutoModelForCausalLM.from_pretrained(cfg.model, **load_kwargs)
-
-        # BetterTransformer transform (optional)
-        if self._bt_transform is not None:
-            try:
-                self.model = self._bt_transform(self.model, keep_original_model=False)
-                self._bt_enabled = True
-                log.info("[toddric_chat] BetterTransformer enabled")
-            except Exception as e:
-                log.info(f"[toddric_chat] BetterTransformer not used: {e}")
-
         self.model.eval()
 
-        # ---- generation defaults ----
         self.gen_base = dict(
             max_new_tokens=self.cfg.max_new_tokens,
             do_sample=self.cfg.do_sample,
             repetition_penalty=self.cfg.repetition_penalty,
             pad_token_id=self._pad_id(),
             eos_token_id=self._eos_id(),
-            top_k=self.cfg.top_k,  # harmless for greedy, pruned when off
-        )
-        self.sample_defaults = dict(
-            temperature=self.cfg.temperature,
-            top_p=self.cfg.top_p,
             top_k=self.cfg.top_k,
         )
+        self.sample_defaults = dict(temperature=self.cfg.temperature, top_p=self.cfg.top_p, top_k=self.cfg.top_k)
 
-        # Warmup thread (speeds first response)
         self._did_warmup = False
         if _env_bool("WARMUP", True):
             import threading
-            threading.Thread(target=self._warmup, name="warmup", daemon=True).start()
+            threading.Thread(target=self._warmup, daemon=True).start()
 
-        log.info(
-            f"[toddric_chat] Loaded model ok. bits={cfg.bits} trust_remote_code={cfg.trust_remote_code} "
-            f"dtype={cfg.dtype} max_new={cfg.max_new_tokens} temp={self.cfg.temperature} "
-            f"top_p={self.cfg.top_p} top_k={self.cfg.top_k} do_sample={self.cfg.do_sample}"
-        )
+        log.info(f"[toddric_chat] Loaded model ok. bits={cfg.bits} dtype={cfg.dtype} max_new={cfg.max_new_tokens} do_sample={self.cfg.do_sample}")
 
-    # ---- warmup --------------------------------------------------------------
-    def _warmup(self):
-        if self._did_warmup:
-            return
-        try:
-            tiny = self._build_prompt("Say 'ok'.")
-            _ = self.generate(tiny, max_new_tokens=4, temperature=0.0, do_sample=False)
-            med = self._build_prompt("List three Irish counties.")
-            _ = self.generate(med, max_new_tokens=24, temperature=0.0, do_sample=False)
-            self._did_warmup = True
-            log.info("[toddric_chat] Warmup complete.")
-        except Exception as e:
-            log.warning(f"[toddric_chat] Warmup failed: {e}")
-
-    # ---- internals -----------------------------------------------------------
+    # --- low-level helpers
     def _pad_id(self) -> int:
-        if self.tokenizer.pad_token_id is not None:
-            return self.tokenizer.pad_token_id
-        if self.tokenizer.eos_token_id is not None:
-            return self.tokenizer.eos_token_id
-        return 0
-
+        return self.tokenizer.pad_token_id or self.tokenizer.eos_token_id or 0
     def _eos_id(self) -> Optional[int]:
         return self.tokenizer.eos_token_id
-
     def _sdp_ctx(self):
-        """Prefer torch.nn.attention.sdpa_kernel() (PyTorch 2.5+); else no-op."""
         try:
             from torch.nn.attention import sdpa_kernel, SDPBackend
-            return sdpa_kernel(
-                SDPBackend.FLASH_ATTENTION,
-                SDPBackend.EFFICIENT_ATTENTION,
-                SDPBackend.MATH,
-            )
+            return sdpa_kernel(SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH)
         except Exception:
             from contextlib import nullcontext
             return nullcontext()
 
-    def _build_prompt(self, message: str, history: Optional[List[Dict[str, str]]] = None) -> str:
+    def _build_prompt(self, message: str, history: Optional[List[Dict[str,str]]]=None) -> str:
         try:
-            msgs: List[Dict[str, str]] = []
-            # Lightweight style guardrail to avoid role-play prefixes.
-            msgs.append({"role": "system", "content": "Answer directly. No role-play. No 'User:'/'Assistant:' tags."})
+            msgs = []
             if self.system_prompt:
-                msgs.append({"role": "system", "content": self.system_prompt})
-            if history:
-                msgs.extend(history[-6:])
-            msgs.append({"role": "user", "content": message})
-            return self.tokenizer.apply_chat_template(
-                msgs, add_generation_prompt=True, tokenize=False
-            )
+                msgs.append({"role":"system","content":self.system_prompt})
+            msgs.append({"role":"system","content":"Answer directly. No role-play. No 'User:' prefixes."})
+            if history: msgs.extend(history[-6:])
+            msgs.append({"role":"user","content":message})
+            return self.tokenizer.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
         except Exception:
-            chat_tmpl = getattr(self, "chat_template", None)
-            if chat_tmpl:
-                return chat_tmpl.replace("{user}", message)
-            sys = f"System: {self.system_prompt}\n" if getattr(self, "system_prompt", "") else ""
+            sys = f"System: {self.system_prompt}\n" if self.system_prompt else ""
             return f"{sys}User: {message}\nAssistant:"
 
-    # ---- recipe intent -------------------------------------------------------
-    def _looks_like_recipe(self, message: str) -> bool:
-        if not self.recipe_autodetect:
-            return False
-        m = message.strip().lower()
-        if m.startswith(("recipe:", "cook:", "make:")):
-            return True
-        hot = ("recipe", "how do i make", "how to make", "ingredients for")
-        return any(h in m for h in hot)
+    # --- warmup (meta-safe)
+    def _warmup(self):
+        if self._did_warmup:
+            return
+        for attempt in range(5):
+            if _has_meta_tensors(self.model):
+                wait = 0.8 * (attempt + 1)
+                log.warning(f"[toddric_chat] Warmup deferred: meta tensors (attempt {attempt+1}); sleeping {wait:.1f}s")
+                time.sleep(wait)
+                continue
+            try:
+                tiny = self._build_prompt("Say ok.")
+                _ = self.generate(tiny, do_sample=False, max_new_tokens=4)
+                med = self._build_prompt("List three Irish counties.")
+                _ = self.generate(med, do_sample=False, max_new_tokens=24)
+                self._did_warmup = True
+                log.info("[toddric_chat] Warmup complete.")
+                return
+            except Exception as e:
+                log.warning(f"[toddric_chat] Warmup failed on attempt {attempt+1}: {e}")
+                time.sleep(0.6 * (attempt + 1))
+        log.warning("[toddric_chat] Warmup skipped after retries.")
 
-    def _generate_recipe_json(self, user_prompt: str) -> Recipe:
-        terms = _required_terms_from_request(user_prompt)
-        first = (
-            f"{JSON_GUARD}\n\n{RECIPE_INSTR}\n\n"
-            f"User request: {user_prompt}\n"
-            f"Required terms (must be present exactly as words): {terms}\n"
-            f"Return JSON:"
-        )
-        p1 = self._build_prompt(first)
-        # greedy + capped length => fast and deterministic
-        raw = self.generate(p1, temperature=0.0, max_new_tokens=self.recipe_max_new, do_sample=False)
-
-        try:
-            obj = json.loads(_extract_json(raw))
-            rec = Recipe.model_validate(obj)
-            _validate_terms(rec, terms)
-            unused = _ingredients_appear_in_steps(rec)
-            if unused:
-                raise ValueError(f"Unused ingredients: {unused}")
-            return rec
-        except Exception as e1:
-            fix = (
-                f"{JSON_GUARD}\nThe previous JSON did not validate.\n"
-                f"User request: {user_prompt}\n"
-                f"Required terms: {terms}\n"
-                f"Error: {e1}\n\nReturn corrected JSON only."
-            )
-            p2 = self._build_prompt(fix)
-            raw2 = self.generate(p2, temperature=0.0, max_new_tokens=self.recipe_max_new, do_sample=False)
-            obj2 = json.loads(_extract_json(raw2))
-            rec2 = Recipe.model_validate(obj2)
-            _validate_terms(rec2, terms)
-            unused2 = _ingredients_appear_in_steps(rec2)
-            if unused2:
-                raise ValueError(f"Unused ingredients after fix: {unused2}")
-            return rec2
-
-    # ---- public generation ---------------------------------------------------
+    # --- unified generate (CLASS-LEVEL: not inside _warmup)
     @torch.inference_mode()
     def generate(self, prompt: str, **overrides) -> str:
-        t_start = time.time()
-
-        # Start from base defaults and apply overrides
-        gen: Dict[str, Any] = dict(self.gen_base)
-        for k, v in overrides.items():
-            if v is not None:
-                gen[k] = v
-
-        # Decide final sampling mode
+        t0 = time.time()
+        gen = dict(self.gen_base)
+        gen.update({k:v for k,v in overrides.items() if v is not None})
         do_sample = bool(gen.get("do_sample", False))
         temp = gen.get("temperature", None)
         if temp is not None and temp <= 0:
             do_sample = False
 
         if do_sample:
-            for k, v in self.sample_defaults.items():
+            for k,v in self.sample_defaults.items():
                 gen.setdefault(k, v)
-            if gen.get("temperature", 1.0) <= 0:
-                gen["temperature"] = 1.0
+            if gen.get("temperature",1.0) <= 0:
+                gen["temperature"]=1.0
         else:
-            gen["do_sample"] = False
-            for k in ("temperature", "top_p", "top_k"):
+            gen["do_sample"]=False
+            for k in ("temperature","top_p","top_k"):
                 gen.pop(k, None)
 
         max_new = int(gen.get("max_new_tokens", 256))
-
         inputs = self.tokenizer(prompt, return_tensors="pt")
-        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+        inputs = {k:v.to(self.model.device) for k,v in inputs.items()}
         in_len = int(inputs["input_ids"].shape[-1])
 
-        # First pass
         with self._sdp_ctx():
             out = self.model.generate(**inputs, **gen)
         text = self.tokenizer.decode(out[0], skip_special_tokens=True)
 
-        # Remove echoed prompt / role tags
         if text.startswith(prompt):
             text = text[len(prompt):].lstrip()
-        for tag in ("Assistant:", "assistant:", "<|assistant|>"):
+        for tag in ("Assistant:","assistant:","<|assistant|>"):
             i = text.find(tag)
             if i != -1:
-                text = text[i + len(tag):].lstrip()
+                text = text[i+len(tag):].lstrip()
                 break
         text = text.strip()
 
-        # Heuristic: did we likely hit the cap?
-        out_len = int(out.shape[-1])
-        gen_tokens = max(0, out_len - in_len)
+        gen_tokens = int(out.shape[-1]) - in_len
         near_cap = gen_tokens >= max_new - 2
-        complete = _looks_complete(text)
-
-        # If we clipped at the cap and have no sentence ending, ask for a tiny continuation.
-        if near_cap and not complete:
-            cont_prompt = f"{prompt}{text}"
-            cont_inputs = self.tokenizer(cont_prompt, return_tensors="pt")
-            cont_inputs = {k: v.to(self.model.device) for k, v in cont_inputs.items()}
-
+        if near_cap and not _looks_complete(text):
+            cont_inputs = self.tokenizer(prompt + text, return_tensors="pt")
+            cont_inputs = {k:v.to(self.model.device) for k,v in cont_inputs.items()}
             cont_kwargs = dict(gen)
-            cont_kwargs["max_new_tokens"] = min(24, max(8, max_new // 10))
-            cont_kwargs["do_sample"] = False
-            for k in ("temperature", "top_p", "top_k"):
+            cont_kwargs["do_sample"]=False
+            cont_kwargs["max_new_tokens"]=min(24, max(8, max_new//10))
+            for k in ("temperature","top_p","top_k"):
                 cont_kwargs.pop(k, None)
-
             with self._sdp_ctx():
                 out2 = self.model.generate(**cont_inputs, **cont_kwargs)
             more = self.tokenizer.decode(out2[0], skip_special_tokens=True)
-
-            if more.startswith(cont_prompt):
-                more = more[len(cont_prompt):].lstrip()
+            if more.startswith(prompt+text):
+                more = more[len(prompt+text):].lstrip()
             text = (text + " " + more.strip()).strip()
 
-        # Final neat trim to last full sentence if still messy
         if not _looks_complete(text):
             text = _trim_to_sentence(text)
 
-        # perf note: tokens/sec
         try:
-            out_ids = self.tokenizer(text, return_tensors=None)["input_ids"]
-            dt = time.time() - t_start
-            if dt > 0:
-                # approximate gen tokens (post-trim)
-                approx_gen = max(0, len(out_ids) - in_len)
-                log.info(f"[toddric_chat] gen tokens≈{approx_gen}  dt={dt:.2f}s  rate≈{max(1,approx_gen)/max(dt,1e-6):.1f} tok/s")
+            toks = len(self.tokenizer(text, return_tensors=None)["input_ids"])
+            dt = time.time()-t0
+            if dt>0:
+                log.info(f"[toddric_chat] gen≈{max(0,toks-in_len)} tok in {dt:.2f}s")
         except Exception:
             pass
-
         return text
 
-    def chat(
-        self,
-        message: str,
-        session_id: Optional[str] = None,
-        history: Optional[List[Dict[str, str]]] = None,
-        **gen_overrides,
-    ) -> Dict[str, Any]:
+    # --- public chat
+    def chat(self, message: str, session_id: Optional[str]=None, history: Optional[List[Dict[str,str]]]=None, **gen_overrides) -> Dict[str,Any]:
         t0 = time.time()
-
-        if self._looks_like_recipe(message):
-            try:
-                msg = re.sub(r"^(recipe:|cook:|make:)\s*", "", message.strip(), flags=re.I)
-                rec = self._generate_recipe_json(msg)
-                text = _render_recipe_md(rec)
-                return {
-                    "text": text,
-                    "used_rag": False,
-                    "provenance": {"mode": "recipe", "json": rec.model_dump()},
-                    "latency_ms": int((time.time() - t0) * 1000),
-                    "model": self.cfg.model,
-                    "session_id": session_id,
-                }
-            except Exception as e:
-                prompt_fb = self._build_prompt(message, history=history)
-                reply_fb = self.generate(prompt_fb, **gen_overrides)
-                return {
-                    "text": reply_fb + f"\n\n[Note: recipe struct failed: {e}]",
-                    "used_rag": False,
-                    "provenance": None,
-                    "latency_ms": int((time.time() - t0) * 1000),
-                    "model": self.cfg.model,
-                    "session_id": session_id,
-                }
-
+        kind = intent_of(message)
+        params = gen_params_for(kind)
+        params.update(gen_overrides or {})
         prompt = self._build_prompt(message, history=history)
-        reply = self.generate(prompt, **gen_overrides)
+        reply = self.generate(prompt, **params)
+        reply = enforce_topic(message, reply, self)
+        reply = enforce_contract(reply, kind)
         return {
             "text": reply,
             "used_rag": False,
-            "provenance": None,
-            "latency_ms": int((time.time() - t0) * 1000),
+            "provenance": {"intent": kind},
+            "latency_ms": int((time.time()-t0)*1000),
             "model": self.cfg.model,
             "session_id": session_id,
         }
 
-# ----------------
-# Module-level API
-# ----------------
+# module-level singleton
 _engine: Optional[ChatEngine] = None
-
 def _get_engine() -> ChatEngine:
     global _engine
     if _engine is None:
@@ -649,6 +418,5 @@ def _get_engine() -> ChatEngine:
         _engine = ChatEngine(cfg)
     return _engine
 
-def chat(message: str, session_id: Optional[str] = None) -> Dict[str, Any]:
-    eng = _get_engine()
-    return eng.chat(message=message, session_id=session_id)
+def chat(message: str, session_id: Optional[str]=None) -> Dict[str,Any]:
+    return _get_engine().chat(message=message, session_id=session_id)
