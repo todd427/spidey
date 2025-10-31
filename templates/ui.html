@@ -1,30 +1,35 @@
 <!doctype html>
 <html lang="en">
-<meta charset="utf-8" />
-<title>toddric • Web UI</title>
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<link rel="stylesheet" href="/static/ui.css?v={{ APP_VERSION }}" />
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>toddric • Web UI</title>
+  <link rel="stylesheet" href="/static/ui.css?v=dev" />
+</head>
 <body>
-    <header id="topbar">
-      <div id="statusText" class="status-text">ready</div>
-      <button id="newChatBtn" class="new-chat">New chat</button>
-      <div id="cloudflareBadge">🇮🇪 cloudflared-ready</div>
-    </header>
+  <!-- Header / status bar -->
+  <header class="appbar">
+    <div class="status ready">ready</div>
+    <button id="newChat" type="button">New chat</button>
+    <div class="cloudflare">🇮🇪 cloudflared-ready</div>
+  </header>
 
-  <main id="log" class="chat-log"></main>
+  <!-- Scrollable conversation area (the thing JS autoscrolls) -->
+  <main id="log" aria-live="polite" aria-busy="false"></main>
 
-  <footer id="composeBar">
-    <form id="composer" data-role="composer">
-      <textarea id="msg" placeholder="Type a message…  (Shift+Enter=send,  Enter=newline)"></textarea>
-      <button id="send" type="submit">Send</button>
-    </form>
-    <div class="meta">
-      <div class="footer-info">
-        <div class="tip">Tip: <kbd>Shift</kbd>+<kbd>Enter</kbd> sends • <kbd>Enter</kbd> adds a newline.</div>
-      </div>
+  <!-- Composer -->
+  <footer class="composer">
+    <div class="row">
+      <textarea id="input" placeholder="Type a message…  (Shift+Enter=send,  Enter=newline)" spellcheck="true"></textarea>
+      <button id="send" type="button">Send</button>
+    </div>
+
+    <!-- Tip (hidden by default; toggle with Ctrl/Cmd + ?) -->
+    <div id="tipWrap">
+      <small>Tip: <code>Shift+Enter</code> sends • <code>Enter</code> adds a newline.</small>
     </div>
   </footer>
 
-  <script src="/static/ui.js?v={{ APP_VERSION }}"></script>
+  <script src="/static/ui.js?v=dev" defer></script>
 </body>
 </html>

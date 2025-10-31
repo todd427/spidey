@@ -1,155 +1,138 @@
-/* toddric-spidey UI — robust selectors, autoscroll, disabled send, slow indicator */
-(() => {
-  // --------- helpers ----------
-  const qsAny = (selList) => {
-    for (const sel of selList) {
-      const el = document.querySelector(sel);
-      if (el) return el;
-    }
-    return null;
-  };
+// ui.js — robust autoscroll, Shift+Enter send, disabled Send while busy,
+// louder status labels, and clean "New chat" reset.
 
-  // Elements (fallbacks so it survives markup tweaks)
-  const log     = qsAny(['#log','main#log','.chat-log','[data-role="log"]']);
-  const form    = qsAny(['#composer','form#composer','[data-role="composer"]','form[action="/chat"]']);
-  const input   = qsAny(['#msg','#input','textarea#input','textarea[name="message"]','[data-role="input"]','textarea']);
-  const sendBtn = qsAny(['#send','#sendBtn','button#sendBtn','button[type="submit"]','[data-role="send"]']);
-  const status  = qsAny(['#statusText','.status-text','[data-role="status"]']);
-  const newBtn  = qsAny(['#newChatBtn','.new-chat','[data-role="new-chat"]']);
+// Small helpers
+const $ = (q, el=document) => el.querySelector(q);
+const logEl    = $("#log");
+const statusEl = $(".status");
+const sendBtn  = $("#send");
+const inputEl  = $("#input");
+const newBtn   = $("#newChat");
+const tipWrap  = $("#tipWrap");
 
-  // Pick a scroller: prefer the chat log; otherwise the page itself
-  const pageScroller = () => document.scrollingElement || document.documentElement || document.body;
-  const scroller = log || pageScroller();
-  const isLog    = !!log;
+// Autoscroll when near bottom (so you can scroll up without being yanked down)
+const nearBottom = () => {
+  const pad = 140;
+  return logEl.scrollHeight - (logEl.scrollTop + logEl.clientHeight) < pad;
+};
+const scrollToBottom = () => {
+  requestAnimationFrame(() => { logEl.scrollTop = logEl.scrollHeight; });
+};
 
-  const setStatus = (text, state='') => {
-    if (!status) return;
-    status.textContent = text;
-    status.dataset.state = state; // ready|sending|slow
-  };
+// Render helpers
+const addMsg = (role, text) => {
+  const row = document.createElement("div");
+  row.className = `msg ${role}`;
+  const b = document.createElement("div");
+  b.className = "bubble";
+  b.textContent = text;
+  row.appendChild(b);
+  logEl.appendChild(row);
+  if (nearBottom()) scrollToBottom();
+};
 
-  const setSending = (flag) => {
-    if (sendBtn) {
-      sendBtn.disabled = flag;
-      sendBtn.classList.toggle('is-disabled', flag);
-      sendBtn.setAttribute('aria-busy', String(flag));
-    }
-    if (form) form.classList.toggle('is-sending', flag);
-  };
-
-  const nearBottom = () => {
-    if (isLog) {
-      return scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 120;
-    }
-    const ps = pageScroller();
-    return ps.scrollTop + window.innerHeight >= ps.scrollHeight - 120;
-    };
-
-  const scrollToBottom = (force=false) => {
-    if (!scroller) return;
-    if (!force && !nearBottom()) return;
-    requestAnimationFrame(() => {
-      if (isLog) {
-        scroller.scrollTop = scroller.scrollHeight;
-      } else {
-        const ps = pageScroller();
-        window.scrollTo({ top: ps.scrollHeight, behavior: 'instant' in window ? 'instant' : 'auto' });
-      }
-    });
-  };
-
-  // Mutation observer: autoscroll when new bubbles appear
-  if (log) {
-    const mo = new MutationObserver(() => scrollToBottom(false));
-    mo.observe(log, { childList: true, subtree: true });
+// UI state
+const setStatus = (kind, label) => {
+  statusEl.classList.remove("ready","sending","slow");
+  statusEl.classList.add(kind);
+  statusEl.textContent = label;
+};
+let slowTm = null;
+const setBusy = (busy) => {
+  sendBtn.disabled = busy;
+  inputEl.readOnly = busy;
+  clearTimeout(slowTm);
+  if (busy) {
+    setStatus("sending", "sending…");
+    slowTm = setTimeout(() => setStatus("sending", "sending… (slow)"), 3000);
+  } else {
+    setStatus("ready", "ready");
   }
+};
 
-  const escapeHtml = (s) => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
-  const bubbleUser = (t) => `<div class="msg right"><div class="bubble user">${escapeHtml(t)}</div></div>`;
-  const bubbleBot  = (t) => `<div class="msg left"><div class="bubble bot"><pre>${escapeHtml(t)}</pre></div></div>`;
-
-  const appendHTML = (html) => {
-    const wasNear = nearBottom();
-    const wrap = document.createElement('div');
-    wrap.innerHTML = html;
-    const parent = log || document.body;
-    while (wrap.firstChild) parent.appendChild(wrap.firstChild);
-    if (wasNear) scrollToBottom(true);
-  };
-
-  const postChat = async (message) => {
-    const r = await fetch('/chat', {
-      method: 'POST',
-      headers: { 'Content-Type':'application/json' },
-      body: JSON.stringify({ message })
+// API
+async function postJSON(url, data, timeoutMs=90000){
+  const ctrl = new AbortController();
+  const tm = setTimeout(()=>ctrl.abort(), timeoutMs);
+  try{
+    const res = await fetch(url, {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify(data),
+      signal: ctrl.signal
     });
-    if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-    return r.json();
-  };
-
-  const SLOW_MS = 1800;
-
-  const send = async (e) => {
-    if (e) e.preventDefault();
-    if (!input) return;
-    const text = input.value.trim();
-    if (!text) return;
-
-    appendHTML(bubbleUser(text));
-    input.value = '';
-    input.style.height = 'auto';
-
-    setSending(true);
-    setStatus('sending…', 'sending');
-    const slowTimer = setTimeout(() => setStatus('sending… (slow)', 'slow'), SLOW_MS);
-
-    try {
-      const data = await postChat(text);
-      clearTimeout(slowTimer);
-      setStatus('ready','ready');
-      const reply = (data && data.text) ? String(data.text) : '[no response]';
-      appendHTML(bubbleBot(reply));
-    } catch (err) {
-      clearTimeout(slowTimer);
-      setStatus('ready','ready');
-      appendHTML(bubbleBot(`[error] ${err.message || err}`));
-    } finally {
-      setSending(false);
-      scrollToBottom(true);
-      input.focus();
+    if(!res.ok){
+      const errText = await res.text().catch(()=>res.statusText);
+      throw new Error(`${res.status} ${errText}`);
     }
-  };
-
-  if (form) form.addEventListener('submit', send);
-  if (sendBtn) sendBtn.addEventListener('click', send);
-
-  // Shift+Enter = send, Enter = newline
-  if (input) {
-    input.addEventListener('keydown', (ev) => {
-      if (ev.key === 'Enter' && ev.shiftKey) {
-        ev.preventDefault();
-        send();
-      }
-    });
-    // auto-grow
-    input.addEventListener('input', () => {
-      input.style.height = 'auto';
-      input.style.height = `${Math.min(240, input.scrollHeight)}px`;
-      scrollToBottom();
-    });
+    return await res.json();
+  } finally {
+    clearTimeout(tm);
   }
+}
 
-  // New chat clears the log
-  if (newBtn) {
-    newBtn.addEventListener('click', () => {
-      if (log) log.innerHTML = '';
-      setStatus('ready','ready');
-      if (input) { input.value=''; input.style.height='auto'; input.focus(); }
-      scrollToBottom(true);
-    });
+// Handlers
+async function sendMessage(){
+  const msg = inputEl.value.trim();
+  if(!msg) return;
+  const shouldStick = nearBottom();
+
+  // Render user bubble and clear composer
+  addMsg("user", msg);
+  inputEl.value = "";
+  inputEl.style.height = "56px";
+  if (shouldStick) scrollToBottom();
+
+  try{
+    setBusy(true);
+    const { text } = await postJSON("/chat", { message: msg });
+    addMsg("bot", text || "(no output)");
+  } catch(e){
+    addMsg("bot", `[error] ${e.message}`);
+  } finally {
+    setBusy(false);
+    if (nearBottom()) scrollToBottom();
   }
+}
 
-  // Initial status/layout
-  setStatus('ready','ready');
-  scrollToBottom(true);
-})();
+sendBtn.addEventListener("click", sendMessage);
+inputEl.addEventListener("keydown", (e)=>{
+  // Shift+Enter sends; Enter inserts newline
+  if(e.key === "Enter" && e.shiftKey){
+    e.preventDefault();
+    sendMessage();
+  }
+});
+newBtn.addEventListener("click", ()=>{
+  logEl.innerHTML = "";
+  setStatus("ready","ready");
+  inputEl.value = "";
+  inputEl.style.height = "56px";
+  inputEl.focus();
+  scrollToBottom();
+});
+
+// Grow textarea with content (cap ~38% of viewport height)
+inputEl.addEventListener("input", ()=>{
+  inputEl.style.height = "auto";
+  const max = Math.max(140, window.innerHeight * 0.38);
+  inputEl.style.height = Math.min(inputEl.scrollHeight, max) + "px";
+});
+
+// First paint tweaks
+window.addEventListener("load", ()=>{
+  // Tip hidden by default; toggle with Ctrl/Cmd + ?
+  if (tipWrap) tipWrap.style.display = "none";
+  setStatus("ready","ready");
+  inputEl.focus();
+  scrollToBottom();
+});
+
+// Optional: toggle tip with Ctrl/Cmd + ?
+window.addEventListener("keydown",(e)=>{
+  if(e.key === "?" && (e.ctrlKey || e.metaKey)){
+    e.preventDefault();
+    if (tipWrap) tipWrap.style.display = tipWrap.style.display === "none" ? "block" : "none";
+    if (nearBottom()) scrollToBottom();
+  }
+});
