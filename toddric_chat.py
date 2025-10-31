@@ -1,536 +1,370 @@
-# toddric_chat.py — routed decoding (rank/howto/creative/general),
-# on-topic guard, answer contract shaping, warmup, SDPA, and file-based system prompt.
+# spidey/toddric_chat.py
+# Chat engine for toddric-spidey:
+# - Router: rank / howto / recipe / creative / general
+# - Stop sequences to prevent "User:" / "Assistant:" bleed
+# - Recipe mode with structured retries
+# - Memory-safe loader: optional 4bit/8bit, GPU budget, CPU offload, OOM retry
+# - Warmup optional (WARMUP=1)
 
 from __future__ import annotations
-
-import os, re, time, json, logging, unicodedata
+import os, re, time, json, logging
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, List
+from typing import List, Optional, Dict, Any
 
 import torch
-from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
-from pydantic import BaseModel
-from transformers import StoppingCriteria, StoppingCriteriaList
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    StoppingCriteria,
+    StoppingCriteriaList,
+)
 
+LOG = logging.getLogger("toddric_chat")
+LOG.setLevel(logging.INFO)
 
-log = logging.getLogger("uvicorn.error")
+# ------------------------- helpers -------------------------
 
-try:
-    torch.set_float32_matmul_precision("high")
-except Exception:
-    pass
-
-class StopOnStrings(StoppingCriteria):
-    def __init__(self, tok, strings: list[str]):
-        self.tok = tok
-        self.stop_ids = [tok(s, add_special_tokens=False, return_tensors="pt")["input_ids"][0] for s in strings]
-    def __call__(self, input_ids, scores, **kwargs):
-        for sids in self.stop_ids:
-            if input_ids[0, -len(sids):].equal(sids.to(input_ids.device)):
-                return True
-        return False
-
-# ---------- small helpers ----------
-def _read_text_file(path: str) -> str:
+def read_text(path: str) -> Optional[str]:
     try:
         with open(path, "r", encoding="utf-8") as f:
             return f.read()
     except Exception:
-        return ""
+        return None
 
-def _resolve_path(p: str) -> str:
-    if os.path.isabs(p):
-        return p
-    here = os.path.dirname(os.path.abspath(__file__))
-    for base in (os.getcwd(), here, os.path.dirname(here)):
-        cand = os.path.join(base, p)
-        if os.path.exists(cand):
-            return cand
-    return p
-
-def _has_meta_tensors(model) -> bool:
-    try:
-        for p in model.parameters():
-            if getattr(p, "device", None) and str(p.device) == "meta":
-                return True
-        for b in getattr(model, "buffers", lambda: [])():
-            if getattr(b, "device", None) and str(b.device) == "meta":
-                return True
-    except Exception:
-        pass
-    return False
-
-def _env_bool(name: str, default: bool=True) -> bool:
+def env_bool(name: str, default: bool=False) -> bool:
     v = os.getenv(name)
-    if v is None: return default
-    return str(v).strip().lower() not in ("0","false","no","off")
+    if v is None:
+        return default
+    return v.strip().lower() in {"1","true","yes","on"}
 
-def _env_int(name: str, default: int) -> int:
-    try: return int(os.getenv(name, default))
-    except Exception: return default
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, "").strip() or default)
+    except Exception:
+        return default
 
-def _env_float(name: str, default: float) -> float:
-    try: return float(os.getenv(name, default))
-    except Exception: return default
-
-def _norm(s: str) -> str:
-    return unicodedata.normalize("NFKC", s).strip()
-
-# ---------- boundary helpers ----------
-SENT_END_RE = re.compile(r'(?s)(.*?[.!?…](?:[)"\]’”]+)?)(\s+|$)')
-
-def _trim_to_sentence(text: str) -> str:
-    t = text.strip()
-    m = SENT_END_RE.match(t)
-    return m.group(1).strip() if m else t
-
-def _looks_complete(text: str) -> bool:
-    return bool(SENT_END_RE.match(text.strip()))
-
-# ---------- intent routing ----------
-def intent_of(q: str) -> str:
-    ql = q.lower()
-    # explicit rank words win first
-    if any(p in ql for p in [" best ", "best?", " top ", "which is the best", "rank ", " vs ", "compare ", "recommend ", "good brands", "good options"]):
-        return "rank"
-    # recipe/how-to
-    if any(p in ql for p in ["recipe", "ingredients", "how to make", "how do i make", "my favorite recipe", "method for", "cook ", "make "]):
-        return "howto"
-    # creative
-    if any(p in ql for p in ["ideas", "brainstorm", "alternatives", "taglines", "slogans", "creative"]):
-        return "creative"
-    return "general"
-
-def gen_params_for(intent: str) -> Dict[str, Any]:
-    if intent in ("rank", "general"):
-        return dict(do_sample=False, max_new_tokens=192)
-    if intent == "howto":
-        return dict(do_sample=False, max_new_tokens=420)
-    # creative
-    return dict(do_sample=True, temperature=0.8, top_p=0.9, top_k=50, max_new_tokens=220)
-
-TOPIC_WORDS = [
-    "champagne","sparkling","garlic","beef","windows","domain","azure","ireland",
-    "pricing","security","donegal","letterkenny","python","django","huggingface"
-]
-
-def enforce_topic(user_q: str, answer: str, engine) -> str:
-    lower_q = user_q.lower()
-    must = [w for w in TOPIC_WORDS if w in lower_q]
-    if must and not any(w in answer.lower() for w in must):
-        fix = f"Answer directly about: {', '.join(must)}. Do not change the topic."
-        tiny = engine._build_prompt(fix + "\n\n" + user_q)
-        return _trim_to_sentence(engine.generate(tiny, do_sample=False, max_new_tokens=64))
-    return answer
-
-RANK_MIN, RANK_MAX = 3, 5
-
-def _bulletize(lines: list[str]) -> list[str]:
-    return [f"- {l.lstrip('-• ').strip()}" for l in lines if l.strip()]
-
-def enforce_contract(ans: str, kind: str) -> str:
-    # strip any dialogue labels anywhere
-    ans = re.sub(r'(?mi)^\s*(User|Assistant)\s*:\s*', '', ans)
-    ans = re.sub(r'\n{3,}', '\n\n', ans).strip()
-
-    if kind == "rank":
-        # harvest plausible items
-        lines = [ln.strip(" •-\t") for ln in ans.splitlines() if ln.strip()]
-        if len(lines) < RANK_MIN:
-            parts = re.split(r'(?:^|\n)[\-\d\.\)]+\s*|[•;]\s*', ans)
-            lines = [p.strip(" •-\t") for p in parts if p and p.strip()]
-        lines = [l for l in lines if len(l) > 2]
-        lines = lines[:RANK_MAX]
-        return "\n".join(_bulletize(lines)) if lines else "- (no items detected)"
-    return _trim_to_sentence(ans)
-
-# ---------- recipe JSON (optional) ----------
-class Ingredient(BaseModel):
-    qty: Optional[str] = None
-    item: str
-    notes: Optional[str] = None
-
-class Recipe(BaseModel):
-    title: str
-    servings: Optional[str] = None
-    total_time: Optional[str] = None
-    ingredients: List[Ingredient]
-    steps: List[str]
-    notes: Optional[List[str]] = None
-
-def _extract_json(text: str) -> str:
-    m = re.search(r"\{.*\}", text, flags=re.S)
-    if not m: raise ValueError("No JSON object found.")
-    return m.group(0)
-
-def _render_recipe_md(rec: Recipe) -> str:
-    out = [rec.title]
-    meta = []
-    if rec.servings: meta.append(f"Serves {rec.servings}")
-    if rec.total_time: meta.append(rec.total_time)
-    if meta: out.append(" • ".join(meta))
-    out.append("")
-    out.append("Ingredients")
-    for it in rec.ingredients:
-        q = (it.qty + " ") if it.qty else ""
-        n = f" ({it.notes})" if it.notes else ""
-        out.append(f"- {q}{it.item}{n}")
-    out.append("")
-    out.append("Method")
-    for i, step in enumerate(rec.steps, 1):
-        out.append(f"{i}) {step}")
-    if rec.notes:
-        out.append("")
-        out.append("Notes")
-        out += [f"- {n}" for n in rec.notes]
-    return "\n".join(out)
-
-# ---------- config ----------
-def _resolve_model() -> str:
-    for k in ("MODEL_ID","MODEL_NAME","TODDRIC_MODEL","MODEL"):
-        v = os.getenv(k)
-        if v and v.strip(): return v.strip()
-    return "toddie314/toddric-1_5b-merged-v1"
+# ------------------------- config -------------------------
 
 @dataclass
 class EngineConfig:
-    model: str
-    trust_remote_code: bool = True
-    bits: Optional[int] = None
-    device_map: str = "auto"
-    dtype: Optional[str] = "auto"
-    max_new_tokens: int = 256
-    temperature: float = 0.7
-    top_p: float = 0.95
-    top_k: int = 50
-    repetition_penalty: float = 1.1
-    do_sample: bool = True
+    model: str = os.getenv("MODEL_ID", os.getenv("MODEL_DIR", "toddie314/toddric_v2_merged"))
+    revision: Optional[str] = os.getenv("REV") or os.getenv("REVISION") or None
+    attn_impl: str = os.getenv("ATTN_IMPL", "sdpa")              # sdpa|eager
+    torch_dtype: Optional[str] = os.getenv("TORCH_DTYPE")        # "bfloat16"|"float16"|None
+    device_map: str = os.getenv("DEVICE_MAP", "auto")
+    trust_remote_code: bool = env_bool("TRUST_REMOTE_CODE", True)
+    system_prompt_file: Optional[str] = os.getenv("SYSTEM_PROMPT_FILE")
+    system_prompt: Optional[str] = os.getenv("SYSTEM_PROMPT")
+    max_ctx: int = env_int("MAX_CONTEXT", 4096)
+    warmup: bool = env_bool("WARMUP", False)  # default off for tight VRAM
 
-    @classmethod
-    def from_env(cls) -> "EngineConfig":
-        bits = None
-        b = os.getenv("BITS") or os.getenv("TODDRIC_BITS")
-        if b and b.isdigit(): bits = int(b)
-        return cls(
-            model=_resolve_model(),
-            trust_remote_code=_env_bool("TRUST_REMOTE_CODE", True),
-            bits=bits if bits in (4,8) else None,
-            device_map="auto",
-            dtype=os.getenv("DTYPE") or os.getenv("TORCH_DTYPE") or "auto",
-            max_new_tokens=_env_int("MAX_NEW_TOKENS", 256),
-            temperature=_env_float("TEMPERATURE", 0.7),
-            top_p=_env_float("TOP_P", 0.95),
-            top_k=_env_int("TOP_K", 50),
-            repetition_penalty=_env_float("REPETITION_PENALTY", 1.1),
-            do_sample=_env_bool("DO_SAMPLE", True),
-        )
+# ------------------------- stopping -------------------------
 
-RE_ING = re.compile(r'^\s*[-*]\s+(.+)', re.M)              # bullet line
-RE_STEP = re.compile(r'^\s*\d+\)\s+(.+)', re.M)             # "1) step"
-def _recipe_is_sane(text: str) -> bool:
-    has_title = bool(text.strip().splitlines()[0].strip())
-    ings = RE_ING.findall(text)
-    steps = RE_STEP.findall(text)
-    return has_title and len(ings) >= 4 and len(steps) >= 3
+class StopOnSeq(StoppingCriteria):
+    """Stop when the last tokens match any stop sequence."""
+    def __init__(self, tokenizer, stops: List[str]):
+        self.stop_ids = [tokenizer.encode(s, add_special_tokens=False) for s in stops]
 
-RECIPE_FEWSHOT = (
-    "Return a compact recipe in markdown with this structure ONLY:\n"
-    "Title\n"
-    "Serves: N | Total Time: X minutes\n"
-    "\n"
-    "Ingredients:\n"
-    "* qty item (notes)\n"
-    "* qty item\n"
-    "\n"
-    "Method:\n"
-    "1) step\n"
-    "2) step\n"
-    "3) step\n"
-    "\n"
-    "No intro text, no dialogue labels, no nutrition panel."
-)
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
+        if input_ids is None or input_ids.shape[1] == 0:
+            return False
+        row = input_ids[0].tolist()
+        for sid in self.stop_ids:
+            n = len(sid)
+            if n and len(row) >= n and row[-n:] == sid:
+                return True
+        return False
 
-# ---------- engine ----------
+# ------------------------- engine -------------------------
+
 class ChatEngine:
     def __init__(self, cfg: EngineConfig):
         self.cfg = cfg
-        log.info(f"[toddric_chat] Resolving model: {cfg.model}")
+        LOG.info("[toddric_chat] Resolving model: %s", cfg.model)
 
-        # system prompt: prefer file, else env
-        sp_file = _resolve_path(os.getenv("SYSTEM_PROMPT_FILE","").strip())
-        sys_prompt = _read_text_file(sp_file).strip() if sp_file else ""
-        if not sys_prompt:
-            sys_prompt = (os.getenv("SYSTEM_PROMPT","") or "").strip()
-        self.system_prompt = sys_prompt
-
-        # tokenizer/model
-        _ = AutoConfig.from_pretrained(cfg.model, trust_remote_code=cfg.trust_remote_code)
-        self.tokenizer = AutoTokenizer.from_pretrained(cfg.model, trust_remote_code=cfg.trust_remote_code, use_fast=True)
-        if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.tokenizer.padding_side = "left"
-
-        load_kwargs: Dict[str, Any] = dict(trust_remote_code=cfg.trust_remote_code, device_map=cfg.device_map, low_cpu_mem_usage=True)
-        if torch.cuda.is_available():
-            load_kwargs["attn_implementation"] = os.getenv("ATTN_IMPL","sdpa")
-
-        resolved_dtype = None
-        if cfg.dtype and cfg.dtype != "auto":
-            resolved_dtype = getattr(torch, cfg.dtype, None)
-
-        if cfg.bits in (4,8) and torch.cuda.is_available():
-            try:
-                import bitsandbytes as _  # noqa
-                if cfg.bits == 4: load_kwargs["load_in_4bit"]=True
-                if cfg.bits == 8: load_kwargs["load_in_8bit"]=True
-            except Exception as e:
-                log.warning(f"[toddric_chat] bnb unavailable: {e}")
-
-        # allow env overrides for device map / low_cpu_mem
-        device_map_env = os.getenv("DEVICE_MAP", "").strip()
-        if device_map_env:
-            load_kwargs["device_map"] = device_map_env
-        low_cpu_mem = os.getenv("LOW_CPU_MEM", None)
-        if low_cpu_mem is not None:
-            load_kwargs["low_cpu_mem_usage"] = str(low_cpu_mem).strip().lower() not in ("0","false","no","off")
-
-        if resolved_dtype is not None:
-            try:
-                self.model = AutoModelForCausalLM.from_pretrained(cfg.model, dtype=resolved_dtype, **load_kwargs)
-            except TypeError:
-                self.model = AutoModelForCausalLM.from_pretrained(cfg.model, torch_dtype=resolved_dtype, **load_kwargs)
-        else:
-            self.model = AutoModelForCausalLM.from_pretrained(cfg.model, **load_kwargs)
-        self.model.eval()
-
-        self.gen_base = dict(
-            max_new_tokens=self.cfg.max_new_tokens,
-            do_sample=self.cfg.do_sample,
-            repetition_penalty=self.cfg.repetition_penalty,
-            pad_token_id=self._pad_id(),
-            eos_token_id=self._eos_id(),
-            top_k=self.cfg.top_k,
+        # --- tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            cfg.model,
+            revision=cfg.revision,
+            trust_remote_code=cfg.trust_remote_code,
         )
-        self.sample_defaults = dict(temperature=self.cfg.temperature, top_p=self.cfg.top_p, top_k=self.cfg.top_k)
 
-        self._did_warmup = False
-        if _env_bool("WARMUP", True):
-            import threading
-            threading.Thread(target=self._warmup, daemon=True).start()
-
-        log.info(f"[toddric_chat] Loaded model ok. bits={cfg.bits} dtype={cfg.dtype} max_new={cfg.max_new_tokens} do_sample={self.cfg.do_sample}")
-
-    # --- low-level helpers
-    def _pad_id(self) -> int:
-        return self.tokenizer.pad_token_id or self.tokenizer.eos_token_id or 0
-    def _eos_id(self) -> Optional[int]:
-        return self.tokenizer.eos_token_id
-    def _sdp_ctx(self):
-        try:
-            from torch.nn.attention import sdpa_kernel, SDPBackend
-            return sdpa_kernel(SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH)
-        except Exception:
-            from contextlib import nullcontext
-            return nullcontext()
-
-    def _build_prompt(self, message: str, history: Optional[List[Dict[str,str]]]=None) -> str:
-        try:
-            msgs = []
-            if self.system_prompt:
-                msgs.append({"role":"system","content":self.system_prompt})
-            msgs.append({"role":"system","content":"Answer directly. No role-play. No 'User:' prefixes."})
-            if history: msgs.extend(history[-6:])
-            msgs.append({"role":"user","content":message})
-            return self.tokenizer.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
-        except Exception:
-            sys = f"System: {self.system_prompt}\n" if self.system_prompt else ""
-            return f"{sys}User: {message}\nAssistant:"
-
-    # --- warmup (meta-safe)
-    def _warmup(self):
-        if self._did_warmup:
-            return
-        for attempt in range(5):
-            if _has_meta_tensors(self.model):
-                wait = 0.8 * (attempt + 1)
-                log.warning(f"[toddric_chat] Warmup deferred: meta tensors (attempt {attempt+1}); sleeping {wait:.1f}s")
-                time.sleep(wait)
-                continue
+        # --- quantization (optional via QUANT)
+        quant = (os.getenv("QUANT", "") or "").strip().lower()
+        quant_config = None
+        if quant in {"4bit", "8bit"}:
             try:
-                tiny = self._build_prompt("Say ok.")
-                _ = self.generate(tiny, do_sample=False, max_new_tokens=4)
-                med = self._build_prompt("List three Irish counties.")
-                _ = self.generate(med, do_sample=False, max_new_tokens=24)
-                self._did_warmup = True
-                log.info("[toddric_chat] Warmup complete.")
-                return
+                from transformers import BitsAndBytesConfig
+                if quant == "4bit":
+                    quant_config = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_quant_type="nf4",
+                        bnb_4bit_use_double_quant=True,
+                        bnb_4bit_compute_dtype=torch.bfloat16,
+                    )
+                else:  # 8bit
+                    quant_config = BitsAndBytesConfig(load_in_8bit=True)
             except Exception as e:
-                log.warning(f"[toddric_chat] Warmup failed on attempt {attempt+1}: {e}")
-                time.sleep(0.6 * (attempt + 1))
-        log.warning("[toddric_chat] Warmup skipped after retries.")
+                LOG.warning("[toddric_chat] BitsAndBytes unavailable; proceeding without quant: %s", e)
+                quant = ""
 
-    # --- unified generate (CLASS-LEVEL: not inside _warmup)
-    @torch.inference_mode()
-    def generate(self, prompt: str, **overrides) -> str:
-        t0 = time.time()
-        gen = dict(self.gen_base)
-        gen.update({k:v for k,v in overrides.items() if v is not None})
-        do_sample = bool(gen.get("do_sample", False))
-        temp = gen.get("temperature", None)
-        if temp is not None and temp <= 0:
-            do_sample = False
+        # --- dtype
+        dtype_map = {
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
+            "float32": torch.float32,
+            None: "auto",
+            "auto": "auto",
+        }
+        dtype = dtype_map.get(cfg.torch_dtype, "auto")
 
-        if do_sample:
-            for k,v in self.sample_defaults.items():
-                gen.setdefault(k, v)
-            if gen.get("temperature",1.0) <= 0:
-                gen["temperature"]=1.0
-        else:
-            gen["do_sample"]=False
-            for k in ("temperature","top_p","top_k"):
-                gen.pop(k, None)
+        # --- memory budget (helps prevent OOM)
+        def _gpu_budget(fraction=0.90):
+            try:
+                prop = torch.cuda.get_device_properties(0)
+                return {0: int(prop.total_memory * fraction), "cpu": "48GiB"}
+            except Exception:
+                return {"cpu": "48GiB"}
 
-        max_new = int(gen.get("max_new_tokens", 256))
-        inputs = self.tokenizer(prompt, return_tensors="pt")
-        inputs = {k:v.to(self.model.device) for k,v in inputs.items()}
-        in_len = int(inputs["input_ids"].shape[-1])
-        stops = StoppingCriteriaList([
-            StopOnStrings(self.tokenizer, ["\nUser:", "\nAssistant:", "User:", "Assistant:"])
-])
-        with self._sdp_ctx():
-            out = self.model.generate(**inputs, **gen, stopping_criteria=stops)
+        offload_dir = os.path.join(os.getcwd(), "offload")
+        os.makedirs(offload_dir, exist_ok=True)
 
-        text = self.tokenizer.decode(out[0], skip_special_tokens=True)
-
-        if text.startswith(prompt):
-            text = text[len(prompt):].lstrip()
-        for tag in ("Assistant:","assistant:","<|assistant|>"):
-            i = text.find(tag)
-            if i != -1:
-                text = text[i+len(tag):].lstrip()
-                break
-        text = text.strip()
-
-        gen_tokens = int(out.shape[-1]) - in_len
-        near_cap = gen_tokens >= max_new - 2
-        if near_cap and not _looks_complete(text):
-            cont_inputs = self.tokenizer(prompt + text, return_tensors="pt")
-            cont_inputs = {k:v.to(self.model.device) for k,v in cont_inputs.items()}
-            cont_kwargs = dict(gen)
-            cont_kwargs["do_sample"]=False
-            cont_kwargs["max_new_tokens"]=min(24, max(8, max_new//10))
-            for k in ("temperature","top_p","top_k"):
-                cont_kwargs.pop(k, None)
-
-            stops = StoppingCriteriaList([
-            StopOnStrings(self.tokenizer, ["\nUser:", "\nAssistant:", "User:", "Assistant:"])
-])
-            with self._sdp_ctx():
-                out2 = self.model.generate(**cont_inputs, **cont_kwargs, stopping_criteria=stops)
-
-
-            more = self.tokenizer.decode(out2[0], skip_special_tokens=True)
-            if more.startswith(prompt+text):
-                more = more[len(prompt+text):].lstrip()
-            text = (text + " " + more.strip()).strip()
-
-        if not _looks_complete(text):
-            text = _trim_to_sentence(text)
+        # --- loader with OOM fallbacks
+        def _load_with(budget_fraction: float):
+            return AutoModelForCausalLM.from_pretrained(
+                cfg.model,
+                revision=cfg.revision,
+                trust_remote_code=cfg.trust_remote_code,
+                low_cpu_mem_usage=True,
+                torch_dtype=("auto" if quant_config else dtype),
+                device_map=cfg.device_map,               # "auto"
+                max_memory=_gpu_budget(budget_fraction), # cap VRAM
+                offload_folder=offload_dir,
+                attn_implementation=cfg.attn_impl,       # "sdpa"
+                quantization_config=quant_config,
+            )
 
         try:
-            toks = len(self.tokenizer(text, return_tensors=None)["input_ids"])
-            dt = time.time()-t0
-            if dt>0:
-                log.info(f"[toddric_chat] gen≈{max(0,toks-in_len)} tok in {dt:.2f}s")
-        except Exception:
-            pass
-        return text
-
-    # --- public chat
-    def chat(self, message: str, session_id: Optional[str]=None, history: Optional[List[Dict[str,str]]]=None, **gen_overrides) -> Dict[str,Any]:
-        t0 = time.time()
-        kind = intent_of(message)
-        params = gen_params_for(kind)
-        params.update(gen_overrides or {})
-
-        # prompt nudges
-        pre = ""
-        if kind == "rank":
-            pre = ("Answer as a short list of specific items only.\n"
-               "No preamble, no dialogue labels, one bullet per line, 3–5 lines.\n")
-        elif kind == "howto":
-            pre = ("Answer with a concise method. Prefer ingredients → steps.\n"
-               "No dialogue labels.\n")
-
-        prompt = self._build_prompt(pre + message, history=history)
-        reply = self.generate(prompt, **params)
-        reply = enforce_topic(message, reply, self)
-
-        # rank enforcement & re-ask if needed
-        if kind == "rank":
-            shaped = enforce_contract(reply, kind)
-            needs_more = shaped.count("\n") + 1 < RANK_MIN
-            if needs_more or "User:" in shaped:
-                strict = (
-                    "List exactly 3 to 5 specific items only (house + cuvée/model if relevant).\n"
-                    "No preamble, one bullet per line, no explanations.\n"
-                )
-                prompt2 = self._build_prompt(strict + message, history=history)
-                reply = enforce_contract(self.generate(prompt2, do_sample=False, max_new_tokens=180), kind)
+            self.model = _load_with(0.90)
+        except torch.cuda.OutOfMemoryError:
+            LOG.warning("[toddric_chat] OOM at 90%% budget; retrying with 75%% and more CPU offload…")
+            torch.cuda.empty_cache()
+            self.model = _load_with(0.75)
+        except RuntimeError as e:
+            if "CUDA out of memory" in str(e):
+                LOG.warning("[toddric_chat] OOM at 90%%; retrying with 75%%…")
+                torch.cuda.empty_cache()
+                self.model = _load_with(0.75)
             else:
-                reply = shaped
+                raise
 
-        # recipe rescue path if missing structure
-        elif kind == "howto":
-            textL = reply.lower()
-            looks_like_recipe = bool(re.search(r"(ingredients|method|steps|serves|yield)", textL))
-            if not looks_like_recipe or not _recipe_is_sane(reply):
-                # first strict attempt
-                prompt_r = self._build_prompt(RECIPE_FEWSHOT + "\n\n" + message, history=history)
-                reply = self.generate(prompt_r, do_sample=False, max_new_tokens=380)
-                # second attempt if still broken
-                if not _recipe_is_sane(reply):
-                    tighter = (
-                        "Output exactly:\n"
-                        "Title line\n"
-                        "Serves: N | Total Time: X minutes\n\n"
-                        "Ingredients:\n"
-                        "* qty item\n"
-                        "* qty item\n"
-                        "* qty item\n"
-                        "* qty item\n\n"
-                        "Method:\n"
-                        "1) step\n"
-                        "2) step\n"
-                        "3) step\n"
-                        "4) step\n"
-                    )
-                    prompt_r2 = self._build_prompt(tighter + "\n\n" + message, history=history)
-                    reply = self.generate(prompt_r2, do_sample=False, max_new_tokens=420)
-            # final tidy
-            reply = reply.strip()
+        self.system_prompt = self._load_system_prompt()
+        LOG.info(
+            "[toddric_chat] Loaded model ok. quant=%s dtype=%s attn=%s device_map=%s",
+            quant or "none", str(dtype), cfg.attn_impl, cfg.device_map
+        )
 
-        else:
-            reply = enforce_contract(reply, kind)
+        if cfg.warmup:
+            self._warmup()
 
-        return {
-            "text": reply.strip(),
-            "used_rag": False,
-            "provenance": {"intent": kind},
-            "latency_ms": int((time.time()-t0)*1000),
-            "model": self.cfg.model,
-            "session_id": session_id,
-        }
+    # ----------------- system prompt -----------------
 
-# module-level singleton
-_engine: Optional[ChatEngine] = None
-def _get_engine() -> ChatEngine:
-    global _engine
-    if _engine is None:
-        cfg = EngineConfig.from_env()
-        log.info(f"[toddric_chat] Final resolved MODEL: {cfg.model}")
-        _engine = ChatEngine(cfg)
-    return _engine
+    def _load_system_prompt(self) -> str:
+        sp = None
+        if self.cfg.system_prompt_file:
+            sp = read_text(self.cfg.system_prompt_file)
+            if sp:
+                return sp.strip()
+        if self.cfg.system_prompt:
+            return self.cfg.system_prompt.strip()
+        # default: concise & permissive for recipes/how-to
+        return (
+            "You are a concise, helpful expert. When the user asks a factual or procedural question, "
+            "answer directly in 1–3 sentences (or a short numbered list). When they ask for a recipe for a specific dish, "
+            "produce a complete, safe recipe with a clear 'Ingredients' list and a numbered 'Method'. "
+            "Avoid adding new chat role headers. Keep responses grounded and practical."
+        )
 
-def chat(message: str, session_id: Optional[str]=None) -> Dict[str,Any]:
-    return _get_engine().chat(message=message, session_id=session_id)
+    # ----------------- warmup -----------------
+
+    def _warmup(self):
+        try:
+            prompts = [
+                "System: You answer concisely.\nUser: Say OK.\nAssistant:",
+                "User: 2+2?\nAssistant:",
+            ]
+            for p in prompts:
+                _ = self._gen(p, max_new_tokens=6, do_sample=False, temperature=0.0, top_p=1.0)
+                time.sleep(0.02)
+        except Exception as e:
+            LOG.warning("[toddric_chat] Warmup skipped: %s", e)
+
+    # ----------------- routing -----------------
+
+    _rank_re = re.compile(r"\b(best|top\s+\d+|rank|ranking|recommend|vs\.?|compare|which.*(should|is better))\b", re.I)
+    _howto_re = re.compile(r"\b(how\s+to|how\s+do\s+i|steps?|method|instructions?)\b", re.I)
+    _recipe_re = re.compile(r"\b(recipe|how\s+to\s+make|ingredients|bake|cook|stew|soup|bread|curry|roast|grill)\b", re.I)
+
+    def _intent_of(self, text: str) -> str:
+        t = text.strip().lower()
+        if self._recipe_re.search(t):
+            return "recipe"
+        if self._howto_re.search(t):
+            return "howto"
+        if self._rank_re.search(t):
+            return "rank"
+        if re.search(r"\b(write|outline|poem|story|joke|pitch|blurb)\b", t):
+            return "creative"
+        return "general"
+
+    # ----------------- generation core -----------------
+
+    def _stops(self) -> StoppingCriteriaList:
+        return StoppingCriteriaList([
+            StopOnSeq(self.tokenizer, ["\nUser:", "\nAssistant:", "\nuser:", "\nassistant:"])
+        ])
+
+    def _gen(self,
+             prompt: str,
+             max_new_tokens: int = 200,
+             temperature: float = 0.7,
+             top_p: float = 0.9,
+             do_sample: bool = True) -> str:
+        """Low-level generate wrapper with stop sequences."""
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        out = self.model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            temperature=max(1e-5, float(temperature)) if do_sample else 1.0,
+            top_p=top_p if do_sample else 1.0,
+            stopping_criteria=self._stops(),
+            eos_token_id=self.tokenizer.eos_token_id,
+            pad_token_id=self.tokenizer.eos_token_id,
+        )
+        text = self.tokenizer.decode(out[0], skip_special_tokens=True)
+        return text[len(prompt):].strip()
+
+    # ----------------- prompt builders -----------------
+
+    def _chat_template(self, history: List[Dict[str,str]], new_user: str) -> str:
+        """Simple conversation template that avoids leaking role headers mid-turn."""
+        parts = [self.system_prompt.strip(), ""]
+        for m in history or []:
+            if m.get("role") == "user":
+                parts.append(f"User: {m['content'].strip()}\nAssistant: {m.get('reply','').strip()}")
+            elif m.get("role") == "assistant":
+                parts.append(m["content"].strip())
+        parts.append(f"User: {new_user.strip()}\nAssistant:")
+        return "\n".join(parts).strip()
+
+    def _recipe_prompt_strict(self, dish: str) -> str:
+        return (
+            f"{self.system_prompt}\n\n"
+            f"User: Give me a complete, safe recipe for {dish}.\n"
+            "Assistant: Provide exactly this structure:\n"
+            "Title\n"
+            "Serves: N | Total Time: X minutes\n\n"
+            "Ingredients:\n"
+            "* qty item (notes)\n"
+            "* qty item\n"
+            "* qty item\n"
+            "* qty item\n\n"
+            "Method:\n"
+            "1) step\n"
+            "2) step\n"
+            "3) step\n"
+            "4) step\n"
+        )
+
+    def _rank_prompt(self, q: str) -> str:
+        return f"{self.system_prompt}\n\nUser: {q}\nAssistant:"
+
+    def _howto_prompt(self, q: str) -> str:
+        return f"{self.system_prompt}\n\nUser: {q}\nAssistant:"
+
+    # ----------------- validators -----------------
+
+    def _looks_like_recipe(self, text: str) -> bool:
+        t = text.lower()
+        has_ing = "ingredients" in t
+        has_method = ("method" in t) or re.search(r"\b(step|steps|directions|instructions)\b", t)
+        return has_ing and has_method
+
+    # ----------------- public API -----------------
+
+    def chat(self, message: str, session_id: Optional[str]=None, **overrides) -> Dict[str, Any]:
+        """
+        Main entry: routes the question and returns {'text': reply}
+        """
+        q = message.strip()
+        intent = self._intent_of(q)
+        LOG.info("[chat] intent=%s  msg=%r", intent, q)
+
+        # Default decoding controls (can be overridden from app)
+        max_new = int(overrides.get("max_new_tokens", 180))
+        temperature = float(overrides.get("temperature", 0.7))
+        top_p = float(overrides.get("top_p", 0.9))
+
+        try:
+            if intent == "rank":
+                prompt = self._rank_prompt(q)
+                reply = self._gen(prompt, max_new_tokens=max_new, do_sample=False, temperature=0.0, top_p=1.0)
+                return {"text": reply}
+
+            if intent == "howto":
+                prompt = self._howto_prompt(q)
+                reply = self._gen(prompt, max_new_tokens=max(300, max_new), do_sample=False, temperature=0.0, top_p=1.0)
+                return {"text": reply}
+
+            if intent == "recipe":
+                dish = q
+                p1 = self._recipe_prompt_strict(dish)
+                r1 = self._gen(p1, max_new_tokens=max(420, max_new), do_sample=False, temperature=0.0, top_p=1.0)
+                if self._looks_like_recipe(r1):
+                    return {"text": r1}
+
+                # lightly sampled second try
+                p2 = self._recipe_prompt_strict(dish) + "\nKeep it concise but complete."
+                r2 = self._gen(p2, max_new_tokens=max(420, max_new), do_sample=True, temperature=0.6, top_p=0.9)
+                if self._looks_like_recipe(r2):
+                    return {"text": r2}
+
+                # final fallback
+                r3 = (
+                    "Here is a basic, safe recipe outline:\n\n"
+                    "Ingredients:\n- (list primary ingredients)\n\n"
+                    "Method:\n1) Prep the ingredients.\n2) Cook main element.\n3) Combine and season.\n4) Rest and serve.\n"
+                )
+                return {"text": r3}
+
+            if intent == "creative":
+                prompt = self._chat_template([], q)
+                reply = self._gen(prompt, max_new_tokens=max_new, do_sample=True, temperature=temperature, top_p=top_p)
+                return {"text": reply}
+
+            # general
+            prompt = self._chat_template([], q)
+            reply = self._gen(prompt, max_new_tokens=max_new, do_sample=False, temperature=0.0, top_p=1.0)
+            return {"text": reply}
+
+        except Exception as e:
+            LOG.exception("[chat] generation error: %s", e)
+            return {"text": f"[error] {e}"}
+
+# ------------------------- convenience factory & legacy singleton -------------------------
+
+def build_engine() -> ChatEngine:
+    return ChatEngine(EngineConfig())
+
+# Back-compat for app_toddric.py
+_engine_singleton = None
+def _get_engine():
+    global _engine_singleton
+    if _engine_singleton is None:
+        _engine_singleton = ChatEngine(EngineConfig())
+    return _engine_singleton
+
+def _reset_engine():
+    global _engine_singleton
+    _engine_singleton = None
