@@ -1,112 +1,135 @@
-:root{
-  --bg:#0b0c10; --panel:#12151d; --panel2:#1b1f2a;
-  --txt:#e8eaf0; --muted:#9aa3b2; --acc:#3b65ff; --bd:#2a2e39;
+/* Layout: single scroll area */
+html, body {
+  height: 100%;
+  margin: 0;
+  background: #0b0f1a;
+  color: #e6edff;
 }
 
-*{ box-sizing:border-box }
-
-/* Pin the page; only #log scrolls */
-html, body{
-  height:100dvh;
-  margin:0;
-  overflow:hidden;                 /* kill outer scrollbar */
-  scroll-behavior:smooth;
-  scrollbar-gutter:stable;
+/* Top bar */
+header#topbar {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 8px;
+  height: 52px;
+  padding: 10px 14px;
+  background: #0f1320;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
 }
 
-/* App column */
-body{
-  display:flex;
-  flex-direction:column;
-  background:var(--bg);
-  color:var(--txt);
-  font:17px/1.55 system-ui, Segoe UI, Roboto, Ubuntu;
+/* Status text larger */
+#statusText, .status-text {
+  justify-self: start;
+  font-size: 14px;
+  color: #b8c3e6;
+}
+#statusText[data-state="sending"], .status-text[data-state="sending"] { color:#d7e0ff; }
+#statusText[data-state="slow"],    .status-text[data-state="slow"]    { color:#ffce7a; }
+#statusText[data-state="ready"],   .status-text[data-state="ready"]   { color:#8fbf8f; }
+
+/* New chat smaller */
+#newChatBtn, .new-chat {
+  justify-self: center;
+  height: 30px;
+  padding: 0 12px;
+  border-radius: 8px;
+  background: #1e273d;
+  color: #cfe0ff;
+  border: 1px solid rgba(255,255,255,0.10);
+  font-size: 13px;
+  font-weight: 600;
 }
 
-/* Header ------------------------------------------------------------------ */
-header{
-  display:flex; align-items:center; gap:8px;
-  padding:12px 16px; border-bottom:1px solid var(--bd);
-  position:sticky; top:0; background:rgba(11,12,16,.9);
-  backdrop-filter:saturate(120%) blur(6px);
-}
-header .dot{ width:8px; height:8px; border-radius:50%; background:#26d07c; box-shadow:0 0 0 2px #153,0 0 10px #26d07c }
-header h1{ font-size:16px; margin:0 6px 0 0; font-weight:600 }
-header .flag{ margin-left:auto; color:#8fc; opacity:.9 }
+/* Cloudflare badge area */
+#cloudflareBadge { justify-self: end; }
 
-/* Status colors (bound to #ready element) */
-#ready.ready   { color:#86efac; }
-#ready.sending { color:#93c5fd; }
-#ready.error   { color:#fca5a5; }
-
-/* Log container (owns scrolling) ----------------------------------------- */
-main#log{
-  max-width:1200px;                /* wider page like ChatGPT */
-  margin:0 auto;
-  padding:20px 24px;
-  display:flex; flex-direction:column; gap:16px;
-  align-items:stretch;              /* rows fill width */
-  flex:1;                           /* fill between header and footer */
-  height:auto;                      /* no calc(); flex handles height */
-  overflow-y:auto;                  /* single, inner scrollbar */
-  overscroll-behavior:contain;
-  -webkit-overflow-scrolling:touch;
+/* Chat log is the only scroller */
+main#log, .chat-log, [data-role="log"] {
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  height: calc(100vh - 170px); /* header + footer */
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
-/* Message rows (left/right lanes) ---------------------------------------- */
-.msg{
-  display:flex;
-  width:100%;
-}
-.msg.me{  justify-content:flex-end; }   /* user on right */
-.msg.bot{ justify-content:flex-start; } /* bot on left */
+/* Messages stretch full row for alignment */
+.msg { display: flex; width: 100%; }
+.msg.left  { justify-content: flex-start; }
+.msg.right { justify-content: flex-end; }
 
-/* Bubbles ---------------------------------------------------------------- */
-/* Wider bubbles: up to 82% of the row, but never exceed container paddings */
-.msg .bubble{
-  max-width:82%;                    /* <-- spread out across the page */
-  padding:12px 16px; border-radius:14px;
-  border:1px solid var(--bd); font-size:16px; line-height:1.55;
-  background:var(--panel);               /* default bot look */
-  margin:0;
-  white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;
-  overflow-x:hidden; overflow-y:visible;
+/* Bubbles */
+.bubble {
+  position: relative;
+  max-width: min(780px, 88%);
+  padding: 14px 16px;
+  border-radius: 12px;
+  line-height: 1.35;
+  box-shadow: 0 1px 0 rgba(0,0,0,.25) inset, 0 4px 16px rgba(0,0,0,.2);
+  border: 1px solid rgba(255,255,255,.06);
+  white-space: pre-wrap;
+  word-break: break-word;
 }
-.msg.me .bubble{ background:var(--panel2); }  /* user look */
+.bubble.user {
+  background: #2b3243;
+  color: #dfe6ff;
+  text-align: left;
+}
+.bubble.bot {
+  background: #1f2533;
+  color: #e8f0ff;
+  text-align: left; /* flush-left answers */
+}
+.bubble.bot pre {
+  margin: 0;
+  font: 500 13.5px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  white-space: pre-wrap;
+}
 
-/* Ensure pre content wraps nicely inside bubbles */
-#log .bubble pre, #log .bubble pre code{ white-space:pre-wrap; }
-#log .bubble img{ max-width:100%; height:auto; display:block; }
+/* Composer (match your HTML: #composeBar, #composer, #msg, #send) */
+footer#composeBar {
+  border-top: 1px solid rgba(255,255,255,.06);
+  background: #0f1320;
+}
+#composer {
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 12px 16px;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 12px;
+  align-items: end;
+}
+#msg {
+  min-height: 56px;
+  max-height: 240px;
+  resize: none;
+  padding: 12px 14px;
+  border-radius: 10px;
+  border: 1px solid rgba(255,255,255,.08);
+  background: #0c101b;
+  color: #e6edff;
+  outline: none;
+}
+#msg::placeholder { color: #9aa6c7; }
 
-/* Footer ----------------------------------------------------------------- */
-footer{
-  position:sticky; bottom:0; background:rgba(11,12,16,.95);
-  border-top:1px solid var(--bd);
+#send {
+  height: 44px;
+  padding: 0 18px;
+  border-radius: 10px;
+  background: #3a63ff;
+  border: 1px solid rgba(255,255,255,.12);
+  color: white;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity .15s ease, transform .02s ease;
 }
-form{
-  display:flex; gap:12px; padding:12px 16px;
-  max-width:1200px;                 /* match the log width */
-  margin:0 auto; align-items:flex-end;
+#send.is-disabled,
+#send:disabled {
+  opacity: .5;
+  cursor: not-allowed;
 }
-textarea,button{
-  border-radius:12px; border:1px solid var(--bd); background:#0b0e14; color:var(--txt);
-}
-textarea{
-  flex:1; resize:none; height:110px; padding:12px 14px; font-size:17px; line-height:1.5;
-  white-space:pre-wrap; overflow-wrap:anywhere;
-}
-button{
-  padding:12px 16px; min-width:96px; background:var(--acc);
-  border-color:#365df0; color:#fff; font-weight:600;
-}
-#reset{ background:#2e7d32; border-color:#246428 }
-
-.meta{
-  color:var(--muted); font-size:12px; margin:6px auto 10px auto;
-  max-width:1200px; padding:0 16px
-}
-kbd{
-  background:#111; border:1px solid #333; border-bottom-color:#222; color:#ddd;
-  border-radius:6px; padding:1px 6px; font-size:.85em
-}
-.footer-info{ display:flex; gap:12px; flex-wrap:wrap }

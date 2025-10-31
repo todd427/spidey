@@ -5,18 +5,16 @@
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <link rel="stylesheet" href="/static/ui.css?v={{ APP_VERSION }}" />
 <body>
-  <header>
-    <div class="dot"></div>
-    <h1>toddric • Web UI</h1>
-    <span class="meta" id="ready">ready</span>
-    <button id="reset" type="button" style="margin-left:8px">New chat</button>
-    <span class="flag meta">🇮🇪 cloudflared-ready</span>
-  </header>
+    <header id="topbar">
+      <div id="statusText" class="status-text">ready</div>
+      <button id="newChatBtn" class="new-chat">New chat</button>
+      <div id="cloudflareBadge">🇮🇪 cloudflared-ready</div>
+    </header>
 
-  <main id="log"></main>
+  <main id="log" class="chat-log"></main>
 
-  <footer>
-    <form id="f">
+  <footer id="composeBar">
+    <form id="composer" data-role="composer">
       <textarea id="msg" placeholder="Type a message…  (Shift+Enter=send,  Enter=newline)"></textarea>
       <button id="send" type="submit">Send</button>
     </form>
