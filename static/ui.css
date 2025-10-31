@@ -4,9 +4,22 @@
 }
 
 *{ box-sizing:border-box }
-html,body{ height:100% }
+
+/* Pin the page; only #log scrolls */
+html, body{
+  height:100dvh;
+  margin:0;
+  overflow:hidden;                 /* kill outer scrollbar */
+  scroll-behavior:smooth;
+  scrollbar-gutter:stable;
+}
+
+/* App column */
 body{
-  margin:0; background:var(--bg); color:var(--txt);
+  display:flex;
+  flex-direction:column;
+  background:var(--bg);
+  color:var(--txt);
   font:17px/1.55 system-ui, Segoe UI, Roboto, Ubuntu;
 }
 
@@ -26,15 +39,16 @@ header .flag{ margin-left:auto; color:#8fc; opacity:.9 }
 #ready.sending { color:#93c5fd; }
 #ready.error   { color:#fca5a5; }
 
-/* Log container (page scrolls here) -------------------------------------- */
+/* Log container (owns scrolling) ----------------------------------------- */
 main#log{
   max-width:980px; margin:0 auto; padding:16px;
   display:flex; flex-direction:column; gap:14px;
-  height:calc(100vh - 170px); /* header + footer */
-  overflow-y:auto; overscroll-behavior:contain;
+  flex:1;                          /* fill between header and footer */
+  height:auto;                     /* no calc(); flex handles height */
+  overflow-y:auto;                 /* single, inner scrollbar */
+  overscroll-behavior:contain;
   -webkit-overflow-scrolling:touch;
 }
-html,body{ scroll-behavior:smooth; scrollbar-gutter:stable }
 
 /* Message rows (left/right lanes) ---------------------------------------- */
 .msg{ display:flex; }
@@ -76,8 +90,12 @@ button{
 }
 #reset{ background:#2e7d32; border-color:#246428 }
 
-.meta{ color:var(--muted); font-size:12px; margin:6px auto 10px auto; max-width:980px; padding:0 12px }
-kbd{ background:#111; border:1px solid #333; border-bottom-color:#222; color:#ddd;
-     border-radius:6px; padding:1px 6px; font-size:.85em }
+.meta{
+  color:var(--muted); font-size:12px; margin:6px auto 10px auto;
+  max-width:980px; padding:0 12px
+}
+kbd{
+  background:#111; border:1px solid #333; border-bottom-color:#222; color:#ddd;
+  border-radius:6px; padding:1px 6px; font-size:.85em
+}
 .footer-info{ display:flex; gap:12px; flex-wrap:wrap }
-
