@@ -105,7 +105,7 @@ def gen_params_for(intent: str) -> Dict[str, Any]:
     if intent in ("rank", "general"):
         return dict(do_sample=False, max_new_tokens=192)
     if intent == "howto":
-        return dict(do_sample=False, max_new_tokens=320)
+        return dict(do_sample=False, max_new_tokens=420)
     # creative
     return dict(do_sample=True, temperature=0.8, top_p=0.9, top_k=50, max_new_tokens=220)
 
@@ -123,21 +123,25 @@ def enforce_topic(user_q: str, answer: str, engine) -> str:
         return _trim_to_sentence(engine.generate(tiny, do_sample=False, max_new_tokens=64))
     return answer
 
+RANK_MIN, RANK_MAX = 3, 5
+
+def _bulletize(lines: list[str]) -> list[str]:
+    return [f"- {l.lstrip('-• ').strip()}" for l in lines if l.strip()]
+
 def enforce_contract(ans: str, kind: str) -> str:
-    # strip any dialogue labels anywhere, not just at the start
+    # strip any dialogue labels anywhere
     ans = re.sub(r'(?mi)^\s*(User|Assistant)\s*:\s*', '', ans)
     ans = re.sub(r'\n{3,}', '\n\n', ans).strip()
+
     if kind == "rank":
-        # carve into 3–5 bullets
+        # harvest plausible items
         lines = [ln.strip(" •-\t") for ln in ans.splitlines() if ln.strip()]
-        if len(lines) < 3:
-            # try punctuation/•/; split fallback
+        if len(lines) < RANK_MIN:
             parts = re.split(r'(?:^|\n)[\-\d\.\)]+\s*|[•;]\s*', ans)
             lines = [p.strip(" •-\t") for p in parts if p and p.strip()]
-        lines = [l for l in lines if len(l) > 2][:5]
-        if not lines:
-            return "- (no items detected)"
-        return "\n".join(f"- {l}" for l in lines[:5])
+        lines = [l for l in lines if len(l) > 2]
+        lines = lines[:RANK_MAX]
+        return "\n".join(_bulletize(lines)) if lines else "- (no items detected)"
     return _trim_to_sentence(ans)
 
 # ---------- recipe JSON (optional) ----------
@@ -220,6 +224,31 @@ class EngineConfig:
             repetition_penalty=_env_float("REPETITION_PENALTY", 1.1),
             do_sample=_env_bool("DO_SAMPLE", True),
         )
+
+RE_ING = re.compile(r'^\s*[-*]\s+(.+)', re.M)              # bullet line
+RE_STEP = re.compile(r'^\s*\d+\)\s+(.+)', re.M)             # "1) step"
+def _recipe_is_sane(text: str) -> bool:
+    has_title = bool(text.strip().splitlines()[0].strip())
+    ings = RE_ING.findall(text)
+    steps = RE_STEP.findall(text)
+    return has_title and len(ings) >= 4 and len(steps) >= 3
+
+RECIPE_FEWSHOT = (
+    "Return a compact recipe in markdown with this structure ONLY:\n"
+    "Title\n"
+    "Serves: N | Total Time: X minutes\n"
+    "\n"
+    "Ingredients:\n"
+    "* qty item (notes)\n"
+    "* qty item\n"
+    "\n"
+    "Method:\n"
+    "1) step\n"
+    "2) step\n"
+    "3) step\n"
+    "\n"
+    "No intro text, no dialogue labels, no nutrition panel."
+)
 
 # ---------- engine ----------
 class ChatEngine:
@@ -440,26 +469,46 @@ class ChatEngine:
         # rank enforcement & re-ask if needed
         if kind == "rank":
             shaped = enforce_contract(reply, kind)
-            if shaped.count("\n") < 2 or "User:" in shaped:
-                strict = ("List exactly 3 to 5 specific items only.\n"
-                      "No preamble, no sentences, no dialogue labels.\n")
+            needs_more = shaped.count("\n") + 1 < RANK_MIN
+            if needs_more or "User:" in shaped:
+                strict = (
+                    "List exactly 3 to 5 specific items only (house + cuvée/model if relevant).\n"
+                    "No preamble, one bullet per line, no explanations.\n"
+                )
                 prompt2 = self._build_prompt(strict + message, history=history)
-                reply = enforce_contract(self.generate(prompt2, do_sample=False, max_new_tokens=160), kind)
+                reply = enforce_contract(self.generate(prompt2, do_sample=False, max_new_tokens=180), kind)
             else:
                 reply = shaped
 
         # recipe rescue path if missing structure
         elif kind == "howto":
             textL = reply.lower()
-            looks_like_recipe = bool(re.search(r"(ingredient|method|step|serves|yield)", textL))
-            if not looks_like_recipe:
-                schema = (
-                    "Return a compact recipe in markdown, with this structure:\n"
-                    "Title\nServes · total time (if known)\n\nIngredients\n- qty item (notes)\n\nMethod\n1) step\n"
-                )
-                prompt_r = self._build_prompt(schema + "\n\n" + message, history=history)
-                reply = self.generate(prompt_r, do_sample=False, max_new_tokens=320)
-                reply = _trim_to_sentence(reply)  # tidy the end
+            looks_like_recipe = bool(re.search(r"(ingredients|method|steps|serves|yield)", textL))
+            if not looks_like_recipe or not _recipe_is_sane(reply):
+                # first strict attempt
+                prompt_r = self._build_prompt(RECIPE_FEWSHOT + "\n\n" + message, history=history)
+                reply = self.generate(prompt_r, do_sample=False, max_new_tokens=380)
+                # second attempt if still broken
+                if not _recipe_is_sane(reply):
+                    tighter = (
+                        "Output exactly:\n"
+                        "Title line\n"
+                        "Serves: N | Total Time: X minutes\n\n"
+                        "Ingredients:\n"
+                        "* qty item\n"
+                        "* qty item\n"
+                        "* qty item\n"
+                        "* qty item\n\n"
+                        "Method:\n"
+                        "1) step\n"
+                        "2) step\n"
+                        "3) step\n"
+                        "4) step\n"
+                    )
+                    prompt_r2 = self._build_prompt(tighter + "\n\n" + message, history=history)
+                    reply = self.generate(prompt_r2, do_sample=False, max_new_tokens=420)
+            # final tidy
+            reply = reply.strip()
 
         else:
             reply = enforce_contract(reply, kind)

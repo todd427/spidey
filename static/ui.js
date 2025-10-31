@@ -1,53 +1,80 @@
-/* ui.js — binds to #log, #msg, #send, #reset, #ready
+/* ui.js — renders bubbles + keybindings + smart autoscroll
    Shift+Enter sends; Enter inserts newline
 */
-
 (function () {
-  // ---- Elements (match ui.html) --------------------------------------------
-  const elChat   = document.getElementById("log");      // <main id="log">
-  const elInput  = document.getElementById("msg");      // <textarea id="msg">
-  const elSend   = document.getElementById("send");     // <button id="send">
-  const elNew    = document.getElementById("reset");    // <button id="reset">
-  const elStatus = document.getElementById("ready");    // <span id="ready">
-  const elSys    = document.getElementById("system-prompt");
-
-  if (!elChat || !elInput || !elSend) {
-    console.error("[ui] missing required elements (#log, #msg, #send)");
+  // ---- Elements -------------------------------------------------------------
+  const elLog   = document.getElementById("log");   // <main id="log">
+  const elMsg   = document.getElementById("msg");   // <textarea id="msg">
+  const elSend  = document.getElementById("send");  // <button id="send">
+  const elNew   = document.getElementById("reset"); // <button id="reset">
+  const elReady = document.getElementById("ready"); // <span id="ready">
+  if (!elLog || !elMsg || !elSend || !elReady) {
+    console.error("[ui] missing a required element");
     return;
   }
 
   // ---- Status ---------------------------------------------------------------
-  function setStatus(kind, extra) {
-    if (!elStatus) return;
-    elStatus.classList.remove("ready", "sending", "error");
+  function setStatus(kind, label) {
+    elReady.classList.remove("ready", "sending", "error");
     if (kind === "sending") {
-      elStatus.classList.add("sending");
-      elStatus.textContent = extra || "sending…";
+      elReady.classList.add("sending");
+      elReady.textContent = label || "sending…";
     } else if (kind === "error") {
-      elStatus.classList.add("error");
-      elStatus.textContent = extra || "error";
+      elReady.classList.add("error");
+      elReady.textContent = label || "error";
     } else {
-      elStatus.classList.add("ready");
-      elStatus.textContent = "ready";
+      elReady.classList.add("ready");
+      elReady.textContent = "ready";
     }
   }
 
-  // ---- Chat bubbles ---------------------------------------------------------
-  function bubble(role, text) {
-    const wrap = document.createElement("div");
-    wrap.className = role === "user" ? "bubble user" : "bubble bot";
+  // ---- Smart autoscroll -----------------------------------------------------
+  let userPinnedTop = false; // true if user scrolled up away from bottom
+
+  function isNearBottom(el, pad = 120) {
+    return el.scrollHeight - el.clientHeight - el.scrollTop <= pad;
+  }
+
+  function scrollToBottom(el, { force = false } = {}) {
+    if (force || isNearBottom(el)) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }
+
+  // track whether user is near the bottom
+  elLog.addEventListener("scroll", () => {
+    userPinnedTop = !isNearBottom(elLog);
+  });
+
+  // optional: keep pinned when streaming/adding nodes rapidly
+  const mo = new MutationObserver(() => scrollToBottom(elLog));
+  mo.observe(elLog, { childList: true, subtree: false });
+
+  // ---- Bubbles --------------------------------------------------------------
+  function makeBubble(role /* 'user'|'bot' */, text) {
+    // wrapper controls alignment (right for user, left for bot)
+    const msg = document.createElement("div");
+    msg.className = role === "user" ? "msg me" : "msg bot";
+
+    const bubble = document.createElement("div");
+    bubble.className = role === "user" ? "bubble user" : "bubble bot";
+
     const pre = document.createElement("pre");
     pre.textContent = text;
-    wrap.appendChild(pre);
-    return wrap;
+
+    bubble.appendChild(pre);
+    msg.appendChild(bubble);
+    return msg;
   }
-  function append(role, text) {
-    const b = bubble(role, text);
-    elChat.appendChild(b);
-    b.scrollIntoView({ behavior: "smooth", block: "end" });
+
+  function appendBubble(role, text) {
+    const node = makeBubble(role, text);
+    elLog.appendChild(node);
+    scrollToBottom(elLog); // only scroll if user is already near bottom
   }
-  function clearChat() {
-    elChat.querySelectorAll(".bubble").forEach((n) => n.remove());
+
+  function clearLog() {
+    elLog.innerHTML = "";
   }
 
   // ---- Helpers --------------------------------------------------------------
@@ -55,32 +82,16 @@
     const res = await fetch(url, opts);
     const ct = res.headers.get("content-type") || "";
     if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
-    if (ct.includes("application/json")) return res.json();
-    return res.text();
+    return ct.includes("application/json") ? res.json() : res.text();
   }
 
-  async function loadSystemPrompt() {
-    if (!elSys) return;
-    try {
-      const raw = await fetchJSONorText("/debug/prompt");
-      let head;
-      if (typeof raw === "string") head = raw.trim();
-      else if (raw && typeof raw === "object")
-        head = raw.system_prompt_head || raw.system || raw.text || JSON.stringify(raw);
-      else head = String(raw);
-      elSys.textContent = head;
-    } catch {
-      elSys.textContent = "(unavailable)";
-    }
-  }
-
-  // ---- Send flow ------------------------------------------------------------
+  // Session id so /chat can thread
   const SESSION_KEY = "toddric_session_id";
   const s4 = () => Math.floor((1 + Math.random()) * 0x10000).toString(16).slice(1);
-  const newSessionId = () => `${s4()}-${s4()}-${s4()}-${s4()}-${Date.now().toString(16)}`;
-  function getSession(reset = false) {
+  const newSession = () => `${s4()}-${s4()}-${s4()}-${s4()}-${Date.now().toString(16)}`;
+  function getSession(reset=false) {
     if (reset) {
-      const id = newSessionId();
+      const id = newSession();
       localStorage.setItem(SESSION_KEY, id);
       return id;
     }
@@ -88,22 +99,24 @@
   }
   let sessionId = getSession();
 
-  let sendLock = false;
+  // ---- Send flow ------------------------------------------------------------
+  let sending = false;
   let slowTimer = null;
 
   async function doSend() {
-    if (sendLock) return;
-    const msg = elInput.value.trim();
+    if (sending) return;
+    const msg = elMsg.value.trim();
     if (!msg) return;
-    elInput.value = "";
-    elInput.blur();   // optional: prevents stray newline on Shift+Enter
-    elInput.focus();
 
-    sendLock = true;
+    // render user bubble right, clear input, force snap-to-bottom (user just acted)
+    appendBubble("user", msg);
+    scrollToBottom(elLog, { force: true });
+    elMsg.value = "";
+    elMsg.focus();
+
+    sending = true;
     setStatus("sending");
     slowTimer = setTimeout(() => setStatus("sending", "sending… (slow)"), 8000);
-
-    append("user", msg);
 
     try {
       const res = await fetchJSONorText("/chat", {
@@ -112,40 +125,38 @@
         body: JSON.stringify({ message: msg, session_id: sessionId }),
       });
       clearTimeout(slowTimer);
-      const text = (typeof res === "object" && typeof res.text === "string") ? res.text
-                 : (typeof res === "string" ? res : "[error] malformed response");
-      append("bot", text);
+      const text = (typeof res === "object" && typeof res.text === "string")
+        ? res.text
+        : (typeof res === "string" ? res : "[error] malformed response");
+      appendBubble("bot", text);
+      scrollToBottom(elLog); // gentle: only if near bottom
       setStatus("ready");
     } catch (e) {
       clearTimeout(slowTimer);
-      append("bot", `[error] ${e.message || e}`);
+      appendBubble("bot", `[error] ${e.message || e}`);
+      scrollToBottom(elLog);
       setStatus("error");
     } finally {
-      elInput.value = "";
-      elInput.focus();
-      sendLock = false;
+      sending = false;
+      elMsg.focus();
     }
   }
 
   // ---- Events ---------------------------------------------------------------
   elSend.addEventListener("click", (e) => { e.preventDefault(); doSend(); });
 
-  // Shift+Enter sends; Enter = newline; robust across browsers/IME
-  elInput.addEventListener("keydown", (e) => {
-    if (e.isComposing) return;                 // ignore IME composition
+  // Shift+Enter sends; Enter = newline
+  elMsg.addEventListener("keydown", (e) => {
+    if (e.isComposing) return;
     if (e.key !== "Enter" && e.keyCode !== 13) return;
-
-    if (e.shiftKey || e.ctrlKey || e.metaKey) { // Shift (primary), Ctrl/Cmd (backup)
+    if (e.shiftKey || e.ctrlKey || e.metaKey) {
       e.preventDefault();
       e.stopPropagation();
       doSend();
-      return;
     }
-    // plain Enter => newline (let it happen)
   });
 
-  // Prevent form submit from stealing Enter
-  const form = elInput.closest("form");
+  const form = elMsg.closest("form");
   if (form) {
     form.addEventListener("submit", (e) => {
       e.preventDefault();
@@ -154,18 +165,17 @@
     });
   }
 
-  if (elNew) {
-    elNew.addEventListener("click", (e) => {
-      e.preventDefault();
-      sessionId = getSession(true);
-      clearChat();
-      setStatus("ready");
-      append("bot", "New chat ready.");
-      elInput.focus();
-    });
-  }
+  elNew.addEventListener("click", (e) => {
+    e.preventDefault();
+    sessionId = getSession(true);
+    clearLog();
+    appendBubble("bot", "New chat ready.");
+    scrollToBottom(elLog, { force: true });
+    setStatus("ready");
+    elMsg.focus();
+  });
 
   // ---- Init -----------------------------------------------------------------
   setStatus("ready");
-  loadSystemPrompt();
 })();
+

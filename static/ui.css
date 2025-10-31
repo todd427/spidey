@@ -1,62 +1,83 @@
-:root{--bg:#0b0c10;--panel:#12151d;--panel2:#1b1f2a;--txt:#e8eaf0;--muted:#9aa3b2;--acc:#3b65ff;--bd:#2a2e39}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--txt);font:17px/1.55 system-ui,Segoe UI,Roboto,Ubuntu}
-
-header{display:flex;align-items:center;gap:8px;padding:12px 16px;border-bottom:1px solid var(--bd);position:sticky;top:0;background:rgba(11,12,16,.9);backdrop-filter:saturate(120%) blur(6px)}
-header .dot{width:8px;height:8px;border-radius:50%;background:#26d07c;box-shadow:0 0 0 2px #153,0 0 10px #26d07c}
-header h1{font-size:16px;margin:0 6px 0 0;font-weight:600}
-header .flag{margin-left:auto;color:#8fc;opacity:.9}
-.msg{display:flex}
-.msg .bubble{max-width:78ch;padding:12px 14px;border-radius:14px;border:1px solid var(--bd);white-space:pre-wrap;font-size:16px;line-height:1.55}
-.msg.me{justify-content:flex-end}
-.msg.me .bubble{background:var(--panel2)}
-.msg.bot .bubble{background:var(--panel)}
-.system{color:var(--muted);font-size:13px}
-footer{position:sticky;bottom:0;background:rgba(11,12,16,.95);border-top:1px solid var(--bd)}
-form{display:flex;gap:10px;padding:12px;max-width:980px;margin:0 auto;align-items:flex-end}
-textarea,button{border-radius:12px;border:1px solid var(--bd);background:#0b0e14;color:var(--txt)}
-textarea{flex:1;resize:none;height:110px;padding:12px 14px;font-size:17px;line-height:1.5}
-button{padding:12px 16px;min-width:96px;background:var(--acc);border-color:#365df0;color:#fff;font-weight:600}
-.meta{color:var(--muted);font-size:12px;margin:6px auto 10px auto;max-width:980px;padding:0 12px}
-kbd{background:#111;border:1px solid #333;border-bottom-color:#222;color:#ddd;border-radius:6px;padding:1px 6px;font-size:.85em}
-#reset{background:#2e7d32;border-color:#246428}
-.footer-info{display:flex;gap:12px;flex-wrap:wrap}
-.footer-info .label{opacity:.7;margin-right:4px}
-/* quick bubble styling */
-.bubble { max-width: 720px; margin: 10px 16px; padding: 12px 16px; border-radius: 14px; white-space: pre-wrap; line-height: 1.35; }
-.bubble.user { margin-left: auto; background: #2b2f3a; color: #eee; border-top-right-radius: 6px; }
-.bubble.bot  { margin-right: auto; background: #121417; color: #e6e6e6; border-top-left-radius: 6px; }
-
-#status.ready { color: #86efac; }      /* green */
-#status.sending { color: #93c5fd; }    /* blue-ish */
-#status.error { color: #fca5a5; }      /* red-ish */
-
-/* Make the page scroll, not bubbles */
-main#log {
-  max-width: 980px;
-  margin: 0 auto;
-  padding: 16px;
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-  height: calc(100vh - 170px); /* header + footer ballpark */
-  overflow-y: auto;            /* scroll here */
+:root{
+  --bg:#0b0c10; --panel:#12151d; --panel2:#1b1f2a;
+  --txt:#e8eaf0; --muted:#9aa3b2; --acc:#3b65ff; --bd:#2a2e39;
 }
 
-/* Wrap bot/user content nicely */
-#log .bubble, #log .bubble pre {
-  white-space: pre-wrap;      /* keep newlines, allow wrapping */
-  word-break: break-word;     /* break long words/URLs if needed */
-  overflow-wrap: anywhere;    /* modern fallback for very long tokens */
-  overflow-x: hidden;         /* no horizontal scrollbar */
+*{ box-sizing:border-box }
+html,body{ height:100% }
+body{
+  margin:0; background:var(--bg); color:var(--txt);
+  font:17px/1.55 system-ui, Segoe UI, Roboto, Ubuntu;
 }
 
-/* Optional: also wrap the textarea’s content as you type */
-#msg {
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
+/* Header ------------------------------------------------------------------ */
+header{
+  display:flex; align-items:center; gap:8px;
+  padding:12px 16px; border-bottom:1px solid var(--bd);
+  position:sticky; top:0; background:rgba(11,12,16,.9);
+  backdrop-filter:saturate(120%) blur(6px);
 }
+header .dot{ width:8px; height:8px; border-radius:50%; background:#26d07c; box-shadow:0 0 0 2px #153,0 0 10px #26d07c }
+header h1{ font-size:16px; margin:0 6px 0 0; font-weight:600 }
+header .flag{ margin-left:auto; color:#8fc; opacity:.9 }
 
-/* Remove any fixed heights (ensure none are set elsewhere) */
-#log .bubble { max-width: 78ch; }
+/* Status colors (bound to #ready element) */
+#ready.ready   { color:#86efac; }
+#ready.sending { color:#93c5fd; }
+#ready.error   { color:#fca5a5; }
+
+/* Log container (page scrolls here) -------------------------------------- */
+main#log{
+  max-width:980px; margin:0 auto; padding:16px;
+  display:flex; flex-direction:column; gap:14px;
+  height:calc(100vh - 170px); /* header + footer */
+  overflow-y:auto; overscroll-behavior:contain;
+  -webkit-overflow-scrolling:touch;
+}
+html,body{ scroll-behavior:smooth; scrollbar-gutter:stable }
+
+/* Message rows (left/right lanes) ---------------------------------------- */
+.msg{ display:flex; }
+.msg.me{ justify-content:flex-end; }   /* user on right */
+.msg.bot{ justify-content:flex-start; }/* bot on left */
+
+/* Bubbles ---------------------------------------------------------------- */
+.msg .bubble{
+  max-width:78ch; padding:12px 14px; border-radius:14px;
+  border:1px solid var(--bd); font-size:16px; line-height:1.55;
+  background:var(--panel);               /* default bot look */
+  white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;
+  overflow-x:hidden; overflow-y:visible;
+}
+.msg.me .bubble{ background:var(--panel2); }  /* user look */
+
+#log .bubble pre, #log .bubble pre code{ white-space:pre-wrap; }
+#log .bubble img{ max-width:100%; height:auto; display:block; }
+
+/* Footer ----------------------------------------------------------------- */
+footer{
+  position:sticky; bottom:0; background:rgba(11,12,16,.95);
+  border-top:1px solid var(--bd);
+}
+form{
+  display:flex; gap:10px; padding:12px; max-width:980px;
+  margin:0 auto; align-items:flex-end;
+}
+textarea,button{
+  border-radius:12px; border:1px solid var(--bd); background:#0b0e14; color:var(--txt);
+}
+textarea{
+  flex:1; resize:none; height:110px; padding:12px 14px; font-size:17px; line-height:1.5;
+  white-space:pre-wrap; overflow-wrap:anywhere;
+}
+button{
+  padding:12px 16px; min-width:96px; background:var(--acc);
+  border-color:#365df0; color:#fff; font-weight:600;
+}
+#reset{ background:#2e7d32; border-color:#246428 }
+
+.meta{ color:var(--muted); font-size:12px; margin:6px auto 10px auto; max-width:980px; padding:0 12px }
+kbd{ background:#111; border:1px solid #333; border-bottom-color:#222; color:#ddd;
+     border-radius:6px; padding:1px 6px; font-size:.85em }
+.footer-info{ display:flex; gap:12px; flex-wrap:wrap }
 
