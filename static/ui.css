@@ -41,30 +41,40 @@ header .flag{ margin-left:auto; color:#8fc; opacity:.9 }
 
 /* Log container (owns scrolling) ----------------------------------------- */
 main#log{
-  max-width:980px; margin:0 auto; padding:16px;
-  display:flex; flex-direction:column; gap:14px;
-  flex:1;                          /* fill between header and footer */
-  height:auto;                     /* no calc(); flex handles height */
-  overflow-y:auto;                 /* single, inner scrollbar */
+  max-width:1200px;                /* wider page like ChatGPT */
+  margin:0 auto;
+  padding:20px 24px;
+  display:flex; flex-direction:column; gap:16px;
+  align-items:stretch;              /* rows fill width */
+  flex:1;                           /* fill between header and footer */
+  height:auto;                      /* no calc(); flex handles height */
+  overflow-y:auto;                  /* single, inner scrollbar */
   overscroll-behavior:contain;
   -webkit-overflow-scrolling:touch;
 }
 
 /* Message rows (left/right lanes) ---------------------------------------- */
-.msg{ display:flex; }
-.msg.me{ justify-content:flex-end; }   /* user on right */
-.msg.bot{ justify-content:flex-start; }/* bot on left */
+.msg{
+  display:flex;
+  width:100%;
+}
+.msg.me{  justify-content:flex-end; }   /* user on right */
+.msg.bot{ justify-content:flex-start; } /* bot on left */
 
 /* Bubbles ---------------------------------------------------------------- */
+/* Wider bubbles: up to 82% of the row, but never exceed container paddings */
 .msg .bubble{
-  max-width:78ch; padding:12px 14px; border-radius:14px;
+  max-width:82%;                    /* <-- spread out across the page */
+  padding:12px 16px; border-radius:14px;
   border:1px solid var(--bd); font-size:16px; line-height:1.55;
   background:var(--panel);               /* default bot look */
+  margin:0;
   white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;
   overflow-x:hidden; overflow-y:visible;
 }
 .msg.me .bubble{ background:var(--panel2); }  /* user look */
 
+/* Ensure pre content wraps nicely inside bubbles */
 #log .bubble pre, #log .bubble pre code{ white-space:pre-wrap; }
 #log .bubble img{ max-width:100%; height:auto; display:block; }
 
@@ -74,7 +84,8 @@ footer{
   border-top:1px solid var(--bd);
 }
 form{
-  display:flex; gap:10px; padding:12px; max-width:980px;
+  display:flex; gap:12px; padding:12px 16px;
+  max-width:1200px;                 /* match the log width */
   margin:0 auto; align-items:flex-end;
 }
 textarea,button{
@@ -92,7 +103,7 @@ button{
 
 .meta{
   color:var(--muted); font-size:12px; margin:6px auto 10px auto;
-  max-width:980px; padding:0 12px
+  max-width:1200px; padding:0 16px
 }
 kbd{
   background:#111; border:1px solid #333; border-bottom-color:#222; color:#ddd;
