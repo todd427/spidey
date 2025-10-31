@@ -10,6 +10,8 @@ from typing import Optional, Dict, Any, List
 import torch
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
 from pydantic import BaseModel
+from transformers import StoppingCriteria, StoppingCriteriaList
+
 
 log = logging.getLogger("uvicorn.error")
 
@@ -17,6 +19,16 @@ try:
     torch.set_float32_matmul_precision("high")
 except Exception:
     pass
+
+class StopOnStrings(StoppingCriteria):
+    def __init__(self, tok, strings: list[str]):
+        self.tok = tok
+        self.stop_ids = [tok(s, add_special_tokens=False, return_tensors="pt")["input_ids"][0] for s in strings]
+    def __call__(self, input_ids, scores, **kwargs):
+        for sids in self.stop_ids:
+            if input_ids[0, -len(sids):].equal(sids.to(input_ids.device)):
+                return True
+        return False
 
 # ---------- small helpers ----------
 def _read_text_file(path: str) -> str:
@@ -78,10 +90,13 @@ def _looks_complete(text: str) -> bool:
 # ---------- intent routing ----------
 def intent_of(q: str) -> str:
     ql = q.lower()
-    if any(p in ql for p in ["best ", " top ", "which is the best", "rank ", " vs ", "compare "]):
+    # explicit rank words win first
+    if any(p in ql for p in [" best ", "best?", " top ", "which is the best", "rank ", " vs ", "compare ", "recommend ", "good brands", "good options"]):
         return "rank"
-    if any(p in ql for p in ["how to", "how do i", "steps", "recipe", "ingredients", "make "]):
+    # recipe/how-to
+    if any(p in ql for p in ["recipe", "ingredients", "how to make", "how do i make", "my favorite recipe", "method for", "cook ", "make "]):
         return "howto"
+    # creative
     if any(p in ql for p in ["ideas", "brainstorm", "alternatives", "taglines", "slogans", "creative"]):
         return "creative"
     return "general"
@@ -109,16 +124,20 @@ def enforce_topic(user_q: str, answer: str, engine) -> str:
     return answer
 
 def enforce_contract(ans: str, kind: str) -> str:
-    ans = ans.strip()
-    for tag in ("User:", "Assistant:", "assistant:", "<|assistant|>"):
-        if ans.startswith(tag): ans = ans[len(tag):].lstrip()
+    # strip any dialogue labels anywhere, not just at the start
+    ans = re.sub(r'(?mi)^\s*(User|Assistant)\s*:\s*', '', ans)
+    ans = re.sub(r'\n{3,}', '\n\n', ans).strip()
     if kind == "rank":
-        lines = [ln for ln in ans.splitlines() if ln.strip()]
-        if len(lines) <= 1:
-            parts = re.split(r"[;•]\s*", _trim_to_sentence(ans))
-            lines = [p for p in parts if p.strip()]
-        lines = lines[:5]
-        return "\n".join(f"- {ln.lstrip('-• ').strip()}" for ln in lines)
+        # carve into 3–5 bullets
+        lines = [ln.strip(" •-\t") for ln in ans.splitlines() if ln.strip()]
+        if len(lines) < 3:
+            # try punctuation/•/; split fallback
+            parts = re.split(r'(?:^|\n)[\-\d\.\)]+\s*|[•;]\s*', ans)
+            lines = [p.strip(" •-\t") for p in parts if p and p.strip()]
+        lines = [l for l in lines if len(l) > 2][:5]
+        if not lines:
+            return "- (no items detected)"
+        return "\n".join(f"- {l}" for l in lines[:5])
     return _trim_to_sentence(ans)
 
 # ---------- recipe JSON (optional) ----------
@@ -346,9 +365,12 @@ class ChatEngine:
         inputs = self.tokenizer(prompt, return_tensors="pt")
         inputs = {k:v.to(self.model.device) for k,v in inputs.items()}
         in_len = int(inputs["input_ids"].shape[-1])
-
+        stops = StoppingCriteriaList([
+            StopOnStrings(self.tokenizer, ["\nUser:", "\nAssistant:", "User:", "Assistant:"])
+])
         with self._sdp_ctx():
-            out = self.model.generate(**inputs, **gen)
+            out = self.model.generate(**inputs, **gen, stopping_criteria=stops)
+
         text = self.tokenizer.decode(out[0], skip_special_tokens=True)
 
         if text.startswith(prompt):
@@ -370,8 +392,14 @@ class ChatEngine:
             cont_kwargs["max_new_tokens"]=min(24, max(8, max_new//10))
             for k in ("temperature","top_p","top_k"):
                 cont_kwargs.pop(k, None)
+
+            stops = StoppingCriteriaList([
+            StopOnStrings(self.tokenizer, ["\nUser:", "\nAssistant:", "User:", "Assistant:"])
+])
             with self._sdp_ctx():
-                out2 = self.model.generate(**cont_inputs, **cont_kwargs)
+                out2 = self.model.generate(**cont_inputs, **cont_kwargs, stopping_criteria=stops)
+
+
             more = self.tokenizer.decode(out2[0], skip_special_tokens=True)
             if more.startswith(prompt+text):
                 more = more[len(prompt+text):].lstrip()
@@ -395,12 +423,49 @@ class ChatEngine:
         kind = intent_of(message)
         params = gen_params_for(kind)
         params.update(gen_overrides or {})
-        prompt = self._build_prompt(message, history=history)
+
+        # prompt nudges
+        pre = ""
+        if kind == "rank":
+            pre = ("Answer as a short list of specific items only.\n"
+               "No preamble, no dialogue labels, one bullet per line, 3–5 lines.\n")
+        elif kind == "howto":
+            pre = ("Answer with a concise method. Prefer ingredients → steps.\n"
+               "No dialogue labels.\n")
+
+        prompt = self._build_prompt(pre + message, history=history)
         reply = self.generate(prompt, **params)
         reply = enforce_topic(message, reply, self)
-        reply = enforce_contract(reply, kind)
+
+        # rank enforcement & re-ask if needed
+        if kind == "rank":
+            shaped = enforce_contract(reply, kind)
+            if shaped.count("\n") < 2 or "User:" in shaped:
+                strict = ("List exactly 3 to 5 specific items only.\n"
+                      "No preamble, no sentences, no dialogue labels.\n")
+                prompt2 = self._build_prompt(strict + message, history=history)
+                reply = enforce_contract(self.generate(prompt2, do_sample=False, max_new_tokens=160), kind)
+            else:
+                reply = shaped
+
+        # recipe rescue path if missing structure
+        elif kind == "howto":
+            textL = reply.lower()
+            looks_like_recipe = bool(re.search(r"(ingredient|method|step|serves|yield)", textL))
+            if not looks_like_recipe:
+                schema = (
+                    "Return a compact recipe in markdown, with this structure:\n"
+                    "Title\nServes · total time (if known)\n\nIngredients\n- qty item (notes)\n\nMethod\n1) step\n"
+                )
+                prompt_r = self._build_prompt(schema + "\n\n" + message, history=history)
+                reply = self.generate(prompt_r, do_sample=False, max_new_tokens=320)
+                reply = _trim_to_sentence(reply)  # tidy the end
+
+        else:
+            reply = enforce_contract(reply, kind)
+
         return {
-            "text": reply,
+            "text": reply.strip(),
             "used_rag": False,
             "provenance": {"intent": kind},
             "latency_ms": int((time.time()-t0)*1000),

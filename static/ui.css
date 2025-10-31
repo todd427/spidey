@@ -1,19 +1,11 @@
 :root{--bg:#0b0c10;--panel:#12151d;--panel2:#1b1f2a;--txt:#e8eaf0;--muted:#9aa3b2;--acc:#3b65ff;--bd:#2a2e39}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--txt);font:17px/1.55 system-ui,Segoe UI,Roboto,Ubuntu}
-/* ...rest of your CSS from before... */
-:root{--bg:#0b0c10;--panel:#12151d;--panel2:#1b1f2a;--txt:#e8eaf0;--muted:#9aa3b2;--acc:#3b65ff;--bd:#2a2e39}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--txt);font:17px/1.55 system-ui,Segoe UI,Roboto,Ubuntu}
-/* ...rest of your CSS from before... */
 
-:root{--bg:#0b0c10;--panel:#12151d;--panel2:#1b1f2a;--txt:#e8eaf0;--muted:#9aa3b2;--acc:#3b65ff;--bd:#2a2e39}
-*{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--txt);font:17px/1.55 system-ui,Segoe UI,Roboto,Ubuntu}
 header{display:flex;align-items:center;gap:8px;padding:12px 16px;border-bottom:1px solid var(--bd);position:sticky;top:0;background:rgba(11,12,16,.9);backdrop-filter:saturate(120%) blur(6px)}
 header .dot{width:8px;height:8px;border-radius:50%;background:#26d07c;box-shadow:0 0 0 2px #153,0 0 10px #26d07c}
 header h1{font-size:16px;margin:0 6px 0 0;font-weight:600}
 header .flag{margin-left:auto;color:#8fc;opacity:.9}
-main{max-width:980px;margin:0 auto;padding:16px;display:flex;flex-direction:column;gap:14px;overflow-y:auto;height:70vh}
 .msg{display:flex}
 .msg .bubble{max-width:78ch;padding:12px 14px;border-radius:14px;border:1px solid var(--bd);white-space:pre-wrap;font-size:16px;line-height:1.55}
 .msg.me{justify-content:flex-end}
@@ -38,8 +30,21 @@ kbd{background:#111;border:1px solid #333;border-bottom-color:#222;color:#ddd;bo
 #status.ready { color: #86efac; }      /* green */
 #status.sending { color: #93c5fd; }    /* blue-ish */
 #status.error { color: #fca5a5; }      /* red-ish */
+
+/* Make the page scroll, not bubbles */
+main#log {
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  height: calc(100vh - 170px); /* header + footer ballpark */
+  overflow-y: auto;            /* scroll here */
+}
+
 /* Wrap bot/user content nicely */
-#log .bubble pre {
+#log .bubble, #log .bubble pre {
   white-space: pre-wrap;      /* keep newlines, allow wrapping */
   word-break: break-word;     /* break long words/URLs if needed */
   overflow-wrap: anywhere;    /* modern fallback for very long tokens */
@@ -52,8 +57,6 @@ kbd{background:#111;border:1px solid #333;border-bottom-color:#222;color:#ddd;bo
   overflow-wrap: anywhere;
 }
 
-/* (If you still see a scrollbar on the bubble container) */
-#log .bubble {
-  overflow-x: hidden;
-}
+/* Remove any fixed heights (ensure none are set elsewhere) */
+#log .bubble { max-width: 78ch; }
 
